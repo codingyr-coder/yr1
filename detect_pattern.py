@@ -1,5 +1,6 @@
 import os
 import requests
+from datetime import datetime, timezone
 
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
@@ -28,10 +29,6 @@ def get_klines(symbol, interval, limit=100):
     return candles
 
 def find_pattern(candles):
-    """
-    يبحث عن نموذج صالح (شمعة نطاق + شمعة سحب بفلتر عمق الفتيل)
-    ضمن آخر الشموع المتاحة. يرجع وصفاً نصياً بالنتيجة.
-    """
     n = len(candles)
     idx = 1
     last_found = None
@@ -40,7 +37,6 @@ def find_pattern(candles):
         prev = candles[idx-1]
         c1 = candles[idx]
 
-        # شرط شمعة النطاق: يجب أن تكسر الشمعة السابقة
         if not (c1["high"] > prev["high"] or c1["low"] < prev["low"]):
             idx += 1
             continue
@@ -88,7 +84,6 @@ def find_pattern(candles):
             idx = j
             continue
 
-        # فحص فلتر عمق الفتيل
         if direction == "bullish":
             wick = min(c2["open"], c2["close"]) - c2["low"]
         else:
@@ -114,21 +109,29 @@ def find_pattern(candles):
 
 def main():
     report_lines = []
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
     for symbol in ["BTCUSDT", "ETHUSDT"]:
         candles = get_klines(symbol, "1h", limit=100)
         result = find_pattern(candles)
+        current_price = candles[-1]["close"]
         if result:
             emoji = "🟢" if result["direction"] == "bullish" else "🔴"
             direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
+            candle2_dt = datetime.fromtimestamp(result["candle2_time"]/1000, tz=timezone.utc)
+            hours_ago = (now_ms - result["candle2_time"]) / (1000*3600)
+            staleness = "🟢 حديث (خلال آخر ساعتين)" if hours_ago <= 2 else f"⚠️ قديم ({hours_ago:.1f} ساعة مضت)"
             report_lines.append(
                 f"{emoji} {symbol}: نموذج {direction_ar} صالح\n"
                 f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
                 f"   قمة النطاق: {result['candle1_high']}\n"
                 f"   قاع النطاق: {result['candle1_low']}\n"
-                f"   مستوى 50%: {result['mid1']:.2f}"
+                f"   مستوى 50%: {result['mid1']:.2f}\n"
+                f"   وقت شمعة السحب (UTC): {candle2_dt.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   الحالة: {staleness}\n"
+                f"   السعر الحالي: {current_price}"
             )
         else:
-            report_lines.append(f"⚪ {symbol}: لا يوجد نموذج صالح حالياً")
+            report_lines.append(f"⚪ {symbol}: لا يوجد نموذج صالح حالياً\n   السعر الحالي: {current_price}")
 
     message = "📊 تقرير كشف النموذج\n\n" + "\n\n".join(report_lines)
     send_telegram(message)
