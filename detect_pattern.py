@@ -93,6 +93,7 @@ def find_pattern(candles):
         if wick_pct >= WICK_THRESHOLD_PCT:
             last_found = {
                 "direction": direction,
+                "candle1_time": c1["open_time"],
                 "candle1_high": high1,
                 "candle1_low": low1,
                 "mid1": mid1,
@@ -117,16 +118,23 @@ def main():
         if result:
             emoji = "🟢" if result["direction"] == "bullish" else "🔴"
             direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
+            candle1_dt = datetime.fromtimestamp(result["candle1_time"]/1000, tz=timezone.utc)
             candle2_dt = datetime.fromtimestamp(result["candle2_time"]/1000, tz=timezone.utc)
             hours_ago = (now_ms - result["candle2_time"]) / (1000*3600)
             staleness = "🟢 حديث (خلال آخر ساعتين)" if hours_ago <= 2 else f"⚠️ قديم ({hours_ago:.1f} ساعة مضت)"
             report_lines.append(
                 f"{emoji} {symbol}: نموذج {direction_ar} صالح\n"
                 f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
+                f"   --- شمعة النطاق (Candle 1) ---\n"
+                f"   وقتها (UTC): {candle1_dt.strftime('%Y-%m-%d %H:%M')}\n"
                 f"   قمة النطاق: {result['candle1_high']}\n"
                 f"   قاع النطاق: {result['candle1_low']}\n"
                 f"   مستوى 50%: {result['mid1']:.2f}\n"
-                f"   وقت شمعة السحب (UTC): {candle2_dt.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   --- شمعة السحب (Candle 2) ---\n"
+                f"   وقتها (UTC): {candle2_dt.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   قمتها: {result['candle2_high']}\n"
+                f"   قاعها: {result['candle2_low']}\n"
+                f"   إغلاقها: {result['candle2_close']}\n"
                 f"   الحالة: {staleness}\n"
                 f"   السعر الحالي: {current_price}"
             )
