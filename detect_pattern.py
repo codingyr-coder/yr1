@@ -136,8 +136,9 @@ def main():
 
     for symbol in ["BTCUSDT", "ETHUSDT"]:
         candles = get_klines(symbol, "1h", limit=100)
-        result = find_pattern(candles)
-        current_price = candles[-1]["close"]
+        current_price = candles[-1]["close"]  # آخر سعر متاح (للعرض فقط)
+        closed_candles = candles[:-1]  # نستبعد الشمعة الأخيرة لأنها قد تكون لم تُغلق بعد
+        result = find_pattern(closed_candles)
 
         if not result:
             continue
