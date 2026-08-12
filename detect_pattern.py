@@ -119,6 +119,7 @@ def find_pattern(candles):
                 "candle2_high": c2["high"],
                 "candle2_low": c2["low"],
                 "candle2_close": c2["close"],
+                "candle2_open": c2["open"],
                 "wick_pct": wick_pct,
                 "candle2_time": c2["open_time"],
             }
@@ -127,59 +128,137 @@ def find_pattern(candles):
 
     return last_found
 
+def find_entry_candle(m5_candles_window, direction):
+    if direction == "bullish":
+        bearish = [c for c in m5_candles_window if c["close"] < c["open"]]
+        if not bearish:
+            return None
+        entry_candle = min(bearish, key=lambda c: c["low"])
+    else:
+        bullish = [c for c in m5_candles_window if c["close"] > c["open"]]
+        if not bullish:
+            return None
+        entry_candle = max(bullish, key=lambda c: c["high"])
+    return entry_candle
+
+def check_confirmation(m5_candles_after, entry_open, direction, sl_level):
+    for c in m5_candles_after:
+        if direction == "bullish":
+            if c["low"] <= sl_level:
+                return "CANCELLED", None
+            if c["close"] > entry_open:
+                return "CONFIRMED", c["open_time"]
+        else:
+            if c["high"] >= sl_level:
+                return "CANCELLED", None
+            if c["close"] < entry_open:
+                return "CONFIRMED", c["open_time"]
+    return None, None
+
 def main():
     state = load_state()
     last_seen = state.get("last_candle2_time", {})
+    pending = state.get("pending_confirmation", {})
     state_changed = False
 
     now_ms = datetime.now(timezone.utc).timestamp() * 1000
 
     for symbol in ["BTCUSDT", "ETHUSDT"]:
-        candles = get_klines(symbol, "1h", limit=100)
-        current_price = candles[-1]["close"]  # آخر سعر متاح (للعرض فقط)
-        closed_candles = candles[:-1]  # نستبعد الشمعة الأخيرة لأنها قد تكون لم تُغلق بعد
-        result = find_pattern(closed_candles)
+        h1_candles = get_klines(symbol, "1h", limit=100)
+        current_price = h1_candles[-1]["close"]
+        closed_h1 = h1_candles[:-1]
+        result = find_pattern(closed_h1)
 
         if not result:
             continue
 
         candle2_time_str = str(result["candle2_time"])
-        previously_seen = last_seen.get(symbol)
 
-        if candle2_time_str == previously_seen:
+        if candle2_time_str != last_seen.get(symbol) and symbol not in pending:
+            emoji = "🟢" if result["direction"] == "bullish" else "🔴"
+            direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
+            candle1_dt = datetime.fromtimestamp(result["candle1_time"]/1000, tz=timezone.utc)
+            candle2_dt = datetime.fromtimestamp(result["candle2_time"]/1000, tz=timezone.utc)
+
+            send_telegram(
+                f"🆕 نموذج جديد! (بانتظار تأكيد فريم 5 دقائق)\n\n"
+                f"{emoji} {symbol}: نموذج {direction_ar}\n"
+                f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
+                f"   وقت شمعة النطاق: {candle1_dt.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   وقت شمعة السحب: {candle2_dt.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   السعر الحالي: {current_price}"
+            )
+
+            last_seen[symbol] = candle2_time_str
+            pending[symbol] = {
+                "direction": result["direction"],
+                "candle1_high": result["candle1_high"],
+                "candle1_low": result["candle1_low"],
+                "mid1": result["mid1"],
+                "candle2_time": result["candle2_time"],
+                "candle2_low": result["candle2_low"],
+                "candle2_high": result["candle2_high"],
+                "entry_candle_found": False,
+                "confirmed": False,
+            }
+            state_changed = True
             continue
 
-        emoji = "🟢" if result["direction"] == "bullish" else "🔴"
-        direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
-        candle1_dt = datetime.fromtimestamp(result["candle1_time"]/1000, tz=timezone.utc)
-        candle2_dt = datetime.fromtimestamp(result["candle2_time"]/1000, tz=timezone.utc)
-        hours_ago = (now_ms - result["candle2_time"]) / (1000*3600)
-        staleness = "🟢 حديث (خلال آخر ساعتين)" if hours_ago <= 2 else f"⚠️ قديم ({hours_ago:.1f} ساعة مضت)"
+        if symbol in pending:
+            p = pending[symbol]
+            direction = p["direction"]
 
-        message = (
-            f"🆕 نموذج جديد!\n\n"
-            f"{emoji} {symbol}: نموذج {direction_ar} صالح\n"
-            f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
-            f"   --- شمعة النطاق (Candle 1) ---\n"
-            f"   وقتها (UTC): {candle1_dt.strftime('%Y-%m-%d %H:%M')}\n"
-            f"   قمة النطاق: {result['candle1_high']}\n"
-            f"   قاع النطاق: {result['candle1_low']}\n"
-            f"   مستوى 50%: {result['mid1']:.2f}\n"
-            f"   --- شمعة السحب (Candle 2) ---\n"
-            f"   وقتها (UTC): {candle2_dt.strftime('%Y-%m-%d %H:%M')}\n"
-            f"   قمتها: {result['candle2_high']}\n"
-            f"   قاعها: {result['candle2_low']}\n"
-            f"   إغلاقها: {result['candle2_close']}\n"
-            f"   الحالة: {staleness}\n"
-            f"   السعر الحالي: {current_price}"
-        )
-        send_telegram(message)
+            if str(p["candle2_time"]) != candle2_time_str:
+                del pending[symbol]
+                state_changed = True
+                continue
 
-        last_seen[symbol] = candle2_time_str
-        state_changed = True
+            m5_candles = get_klines(symbol, "5m", limit=200)
+            closed_m5 = m5_candles[:-1]
+
+            candle2_start = p["candle2_time"]
+            candle2_end = candle2_start + (60*60*1000)
+
+            window_12 = [c for c in closed_m5 if candle2_start <= c["open_time"] < candle2_end]
+
+            if not p["entry_candle_found"]:
+                if len(window_12) < 12:
+                    continue
+                entry_candle = find_entry_candle(window_12, direction)
+                if entry_candle is None:
+                    send_telegram(f"❌ {symbol}: لم توجد شمعة دخول صالحة، تم إلغاء النموذج")
+                    del pending[symbol]
+                    state_changed = True
+                    continue
+                p["entry_open"] = entry_candle["open"]
+                p["entry_time"] = entry_candle["open_time"]
+                p["entry_candle_found"] = True
+                state_changed = True
+
+            if p["entry_candle_found"] and not p["confirmed"]:
+                sl_level = p["candle2_low"] if direction == "bullish" else p["candle2_high"]
+                candles_to_check = [c for c in closed_m5 if c["open_time"] > p["entry_time"]]
+                status, confirm_time = check_confirmation(candles_to_check, p["entry_open"], direction, sl_level)
+
+                if status == "CANCELLED":
+                    send_telegram(f"❌ {symbol}: تم إلغاء النموذج (كسر السعر مستوى SL قبل التأكيد)")
+                    del pending[symbol]
+                    state_changed = True
+                    continue
+                elif status == "CONFIRMED":
+                    emoji = "🟢" if direction == "bullish" else "🔴"
+                    send_telegram(
+                        f"✅ تأكيد! جاهز للدخول (Shadow Mode)\n\n"
+                        f"{emoji} {symbol}\n"
+                        f"   سعر الدخول المستهدف: {p['entry_open']}\n"
+                        f"   وقت التأكيد (UTC): {datetime.fromtimestamp(confirm_time/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+                    )
+                    p["confirmed"] = True
+                    state_changed = True
 
     if state_changed:
         state["last_candle2_time"] = last_seen
+        state["pending_confirmation"] = pending
         save_state(state)
 
 if __name__ == "__main__":
