@@ -8,7 +8,7 @@ TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
 GIST_TOKEN = os.environ['GIST_TOKEN']
 GIST_ID = os.environ['GIST_ID']
 
-BINANCE_BASE = "https://testnet.binancefuture.com"
+BINANCE_BASE = "https://fapi.binance.com"
 WICK_THRESHOLD_PCT = 40.0
 
 def send_telegram(message):
