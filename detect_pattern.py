@@ -11,10 +11,12 @@ GIST_ID = os.environ['GIST_ID']
 BINANCE_BASE = "https://fapi.binance.com"
 WICK_THRESHOLD_PCT = 40.0
 
+# ---------- Telegram ----------
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
 
+# ---------- Gist (الذاكرة) ----------
 def load_state():
     url = f"https://api.github.com/gists/{GIST_ID}"
     headers = {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -31,9 +33,14 @@ def save_state(state):
     r = requests.patch(url, headers=headers, json=payload)
     r.raise_for_status()
 
-def get_klines(symbol, interval, limit=100):
+# ---------- Binance ----------
+def get_klines(symbol, interval, limit=100, start_time=None, end_time=None):
     url = f"{BINANCE_BASE}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if start_time is not None:
+        params["startTime"] = int(start_time)
+    if end_time is not None:
+        params["endTime"] = int(end_time)
     r = requests.get(url, params=params)
     data = r.json()
     candles = []
@@ -47,6 +54,7 @@ def get_klines(symbol, interval, limit=100):
         })
     return candles
 
+# ---------- منطق كشف النموذج على فريم الساعة ----------
 def find_pattern(candles):
     n = len(candles)
     idx = 1
@@ -128,7 +136,11 @@ def find_pattern(candles):
 
     return last_found
 
+# ---------- منطق تحديد شمعة الدخول على فريم 5 دقائق ----------
 def find_entry_candle(m5_candles_window, direction):
+    """
+    m5_candles_window: الـ12 شمعة 5 دقائق المكوّنة لشمعة السحب
+    """
     if direction == "bullish":
         bearish = [c for c in m5_candles_window if c["close"] < c["open"]]
         if not bearish:
@@ -141,7 +153,14 @@ def find_entry_candle(m5_candles_window, direction):
         entry_candle = max(bullish, key=lambda c: c["high"])
     return entry_candle
 
+# ---------- منطق البحث عن التأكيد ----------
 def check_confirmation(m5_candles_after, entry_open, direction, sl_level):
+    """
+    يبحث بين شموع 5 دقائق التي حدثت بعد شمعة الدخول عن:
+    - تأكيد (إغلاق فوق/تحت افتتاح شمعة الدخول)
+    - أو إلغاء (كسر مستوى SL قبل التأكيد)
+    يرجع: ("CONFIRMED", وقت التأكيد) أو ("CANCELLED", None) أو (None, None) إن لم يحدث شيء بعد
+    """
     for c in m5_candles_after:
         if direction == "bullish":
             if c["low"] <= sl_level:
@@ -158,7 +177,7 @@ def check_confirmation(m5_candles_after, entry_open, direction, sl_level):
 def main():
     state = load_state()
     last_seen = state.get("last_candle2_time", {})
-    pending = state.get("pending_confirmation", {})
+    pending = state.get("pending_confirmation", {})  # نماذج بانتظار التأكيد
     state_changed = False
 
     now_ms = datetime.now(timezone.utc).timestamp() * 1000
@@ -174,6 +193,7 @@ def main():
 
         candle2_time_str = str(result["candle2_time"])
 
+        # حالة 1: نموذج جديد لم نره من قبل إطلاقاً -> نبدأ تتبعه
         if candle2_time_str != last_seen.get(symbol) and symbol not in pending:
             emoji = "🟢" if result["direction"] == "bullish" else "🔴"
             direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
@@ -204,26 +224,28 @@ def main():
             state_changed = True
             continue
 
+        # حالة 2: هناك نموذج قيد التتبع لهذا الرمز -> نتابع مرحلة فريم 5 دقائق
         if symbol in pending:
             p = pending[symbol]
             direction = p["direction"]
 
+            # هل تغيّر النموذج (نموذج أحدث ظهر بينما كنا ننتظر)؟ إن كان كذلك، نُلغي القديم ونبدأ الجديد
             if str(p["candle2_time"]) != candle2_time_str:
                 del pending[symbol]
                 state_changed = True
                 continue
 
-            m5_candles = get_klines(symbol, "5m", limit=200)
-            closed_m5 = m5_candles[:-1]
-
             candle2_start = p["candle2_time"]
-            candle2_end = candle2_start + (60*60*1000)
+            candle2_end = candle2_start + (60*60*1000)  # ساعة كاملة بعدها
+
+            m5_candles = get_klines(symbol, "5m", limit=1500, start_time=candle2_start)
+            closed_m5 = m5_candles[:-1]  # نستبعد الشمعة غير المكتملة
 
             window_12 = [c for c in closed_m5 if candle2_start <= c["open_time"] < candle2_end]
 
             if not p["entry_candle_found"]:
                 if len(window_12) < 12:
-                    continue
+                    continue  # لم تكتمل الـ12 شمعة بعد، ننتظر
                 entry_candle = find_entry_candle(window_12, direction)
                 if entry_candle is None:
                     send_telegram(f"❌ {symbol}: لم توجد شمعة دخول صالحة، تم إلغاء النموذج")
@@ -237,6 +259,7 @@ def main():
 
             if p["entry_candle_found"] and not p["confirmed"]:
                 sl_level = p["candle2_low"] if direction == "bullish" else p["candle2_high"]
+                # نفحص كل شمعة تلت شمعة الدخول مباشرة، سواء كانت لا تزال ضمن ساعة شمعة السحب أو بعدها
                 candles_to_check = [c for c in closed_m5 if c["open_time"] > p["entry_time"]]
                 status, confirm_time = check_confirmation(candles_to_check, p["entry_open"], direction, sl_level)
 
@@ -255,6 +278,7 @@ def main():
                     )
                     p["confirmed"] = True
                     state_changed = True
+                    # المرحلة التالية (انتظار التنفيذ الفعلي، SL/TP) ستُضاف لاحقاً
 
     if state_changed:
         state["last_candle2_time"] = last_seen
