@@ -8,7 +8,7 @@ TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
 GIST_TOKEN = os.environ['GIST_TOKEN']
 GIST_ID = os.environ['GIST_ID']
 
-BINANCE_BASE = "https://fapi.binance.com"
+BINANCE_BASE = "https://data-api.binance.vision"  # مصدر بيانات بديل غير محظور من مزوّدي الخدمات السحابية
 WICK_THRESHOLD_PCT = 40.0
 
 # ---------- Telegram ----------
@@ -35,7 +35,7 @@ def save_state(state):
 
 # ---------- Binance ----------
 def get_klines(symbol, interval, limit=100, start_time=None, end_time=None):
-    url = f"{BINANCE_BASE}/fapi/v1/klines"
+    url = f"{BINANCE_BASE}/api/v3/klines"  # مسار السوق الفوري (Spot)، متوافق مع هذا النطاق البديل
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     if start_time is not None:
         params["startTime"] = int(start_time)
