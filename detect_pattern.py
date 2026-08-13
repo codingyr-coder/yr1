@@ -252,6 +252,11 @@ def main():
             continue
 
         p = pending[symbol]
+        if "status" not in p:
+            # بيانات محفوظة بصيغة قديمة غير متوافقة -> نتجاهلها ونبدأ من جديد لهذا الرمز
+            del pending[symbol]
+            state_changed = True
+            continue
         direction = p["direction"]
 
         if result and str(p["candle2_time"]) != str(result["candle2_time"]) and p["status"] in ("waiting_confirmation",):
