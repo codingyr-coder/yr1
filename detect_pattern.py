@@ -8,8 +8,11 @@ TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
 GIST_TOKEN = os.environ['GIST_TOKEN']
 GIST_ID = os.environ['GIST_ID']
 
-BINANCE_BASE = "https://data-api.binance.vision"  # مصدر بيانات بديل غير محظور من مزوّدي الخدمات السحابية
+BINANCE_BASE = "https://data-api.binance.vision"
 WICK_THRESHOLD_PCT = 40.0
+
+SL_BUFFER = {"BTCUSDT": 5.0, "ETHUSDT": 0.5}
+STOPLIMIT_OFFSET = {"BTCUSDT": 3.0, "ETHUSDT": 0.3}
 
 # ---------- Telegram ----------
 def send_telegram(message):
@@ -35,7 +38,7 @@ def save_state(state):
 
 # ---------- Binance ----------
 def get_klines(symbol, interval, limit=100, start_time=None, end_time=None):
-    url = f"{BINANCE_BASE}/api/v3/klines"  # مسار السوق الفوري (Spot)، متوافق مع هذا النطاق البديل
+    url = f"{BINANCE_BASE}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     if start_time is not None:
         params["startTime"] = int(start_time)
@@ -136,32 +139,22 @@ def find_pattern(candles):
 
     return last_found
 
-# ---------- منطق تحديد شمعة الدخول على فريم 5 دقائق ----------
+# ---------- منطق تحديد شمعة الدخول ----------
 def find_entry_candle(m5_candles_window, direction):
-    """
-    m5_candles_window: الـ12 شمعة 5 دقائق المكوّنة لشمعة السحب
-    """
     if direction == "bullish":
         bearish = [c for c in m5_candles_window if c["close"] < c["open"]]
         if not bearish:
             return None
-        entry_candle = min(bearish, key=lambda c: c["low"])
+        return min(bearish, key=lambda c: c["low"])
     else:
         bullish = [c for c in m5_candles_window if c["close"] > c["open"]]
         if not bullish:
             return None
-        entry_candle = max(bullish, key=lambda c: c["high"])
-    return entry_candle
+        return max(bullish, key=lambda c: c["high"])
 
 # ---------- منطق البحث عن التأكيد ----------
-def check_confirmation(m5_candles_after, entry_open, direction, sl_level):
-    """
-    يبحث بين شموع 5 دقائق التي حدثت بعد شمعة الدخول عن:
-    - تأكيد (إغلاق فوق/تحت افتتاح شمعة الدخول)
-    - أو إلغاء (كسر مستوى SL قبل التأكيد)
-    يرجع: ("CONFIRMED", وقت التأكيد) أو ("CANCELLED", None) أو (None, None) إن لم يحدث شيء بعد
-    """
-    for c in m5_candles_after:
+def check_confirmation(candles_after, entry_open, direction, sl_level):
+    for c in candles_after:
         if direction == "bullish":
             if c["low"] <= sl_level:
                 return "CANCELLED", None
@@ -174,13 +167,52 @@ def check_confirmation(m5_candles_after, entry_open, direction, sl_level):
                 return "CONFIRMED", c["open_time"]
     return None, None
 
+# ---------- منطق انتظار التنفيذ (الأمر المعلق) ----------
+def check_fill(candles_after, entry_open, direction, far_target):
+    for c in candles_after:
+        if direction == "bullish":
+            if c["high"] >= far_target:
+                return "CANCELLED_NO_FILL", None
+            if c["low"] <= entry_open:
+                return "FILLED", c["open_time"]
+        else:
+            if c["low"] <= far_target:
+                return "CANCELLED_NO_FILL", None
+            if c["high"] >= entry_open:
+                return "FILLED", c["open_time"]
+    return None, None
+
+# ---------- منطق إدارة الصفقة المفتوحة (SL/TP) ----------
+def check_position(candles_after, direction, sl_trigger, sl_limit, tp1):
+    for c in candles_after:
+        if direction == "bullish":
+            hit_sl = c["low"] <= sl_trigger
+            hit_tp = c["high"] >= tp1
+            if hit_sl and hit_tp:
+                return "SL", c["open_time"]  # الأسوأ دائماً
+            if hit_sl:
+                return "SL", c["open_time"]
+            if hit_tp:
+                return "TP1", c["open_time"]
+        else:
+            hit_sl = c["high"] >= sl_trigger
+            hit_tp = c["low"] <= tp1
+            if hit_sl and hit_tp:
+                return "SL", c["open_time"]
+            if hit_sl:
+                return "SL", c["open_time"]
+            if hit_tp:
+                return "TP1", c["open_time"]
+    return None, None
+
+def fmt(ts):
+    return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+
 def main():
     state = load_state()
     last_seen = state.get("last_candle2_time", {})
-    pending = state.get("pending_confirmation", {})  # نماذج بانتظار التأكيد
+    pending = state.get("pending_confirmation", {})
     state_changed = False
-
-    now_ms = datetime.now(timezone.utc).timestamp() * 1000
 
     for symbol in ["BTCUSDT", "ETHUSDT"]:
         h1_candles = get_klines(symbol, "1h", limit=100)
@@ -188,64 +220,56 @@ def main():
         closed_h1 = h1_candles[:-1]
         result = find_pattern(closed_h1)
 
-        if not result:
-            continue
-
-        candle2_time_str = str(result["candle2_time"])
-
-        # حالة 1: نموذج جديد لم نره من قبل إطلاقاً -> نبدأ تتبعه
-        if candle2_time_str != last_seen.get(symbol) and symbol not in pending:
-            emoji = "🟢" if result["direction"] == "bullish" else "🔴"
-            direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
-            candle1_dt = datetime.fromtimestamp(result["candle1_time"]/1000, tz=timezone.utc)
-            candle2_dt = datetime.fromtimestamp(result["candle2_time"]/1000, tz=timezone.utc)
-
-            send_telegram(
-                f"🆕 نموذج جديد! (بانتظار تأكيد فريم 5 دقائق)\n\n"
-                f"{emoji} {symbol}: نموذج {direction_ar}\n"
-                f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
-                f"   وقت شمعة النطاق: {candle1_dt.strftime('%Y-%m-%d %H:%M')}\n"
-                f"   وقت شمعة السحب: {candle2_dt.strftime('%Y-%m-%d %H:%M')}\n"
-                f"   السعر الحالي: {current_price}"
-            )
-
-            last_seen[symbol] = candle2_time_str
-            pending[symbol] = {
-                "direction": result["direction"],
-                "candle1_high": result["candle1_high"],
-                "candle1_low": result["candle1_low"],
-                "mid1": result["mid1"],
-                "candle2_time": result["candle2_time"],
-                "candle2_low": result["candle2_low"],
-                "candle2_high": result["candle2_high"],
-                "entry_candle_found": False,
-                "confirmed": False,
-            }
-            state_changed = True
-            continue
-
-        # حالة 2: هناك نموذج قيد التتبع لهذا الرمز -> نتابع مرحلة فريم 5 دقائق
-        if symbol in pending:
-            p = pending[symbol]
-            direction = p["direction"]
-
-            # هل تغيّر النموذج (نموذج أحدث ظهر بينما كنا ننتظر)؟ إن كان كذلك، نُلغي القديم ونبدأ الجديد
-            if str(p["candle2_time"]) != candle2_time_str:
-                del pending[symbol]
+        # ===== حالة 1: نموذج جديد =====
+        if result:
+            candle2_time_str = str(result["candle2_time"])
+            if candle2_time_str != last_seen.get(symbol) and symbol not in pending:
+                emoji = "🟢" if result["direction"] == "bullish" else "🔴"
+                direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
+                send_telegram(
+                    f"🆕 نموذج جديد! (بانتظار تأكيد فريم 5 دقائق)\n\n"
+                    f"{emoji} {symbol}: نموذج {direction_ar}\n"
+                    f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
+                    f"   وقت شمعة النطاق: {fmt(result['candle1_time'])}\n"
+                    f"   وقت شمعة السحب: {fmt(result['candle2_time'])}\n"
+                    f"   السعر الحالي: {current_price}"
+                )
+                last_seen[symbol] = candle2_time_str
+                pending[symbol] = {
+                    "status": "waiting_confirmation",
+                    "direction": result["direction"],
+                    "candle1_high": result["candle1_high"],
+                    "candle1_low": result["candle1_low"],
+                    "mid1": result["mid1"],
+                    "candle2_time": result["candle2_time"],
+                    "candle2_low": result["candle2_low"],
+                    "candle2_high": result["candle2_high"],
+                }
                 state_changed = True
                 continue
 
-            candle2_start = p["candle2_time"]
-            candle2_end = candle2_start + (60*60*1000)  # ساعة كاملة بعدها
+        if symbol not in pending:
+            continue
 
-            m5_candles = get_klines(symbol, "5m", limit=1500, start_time=candle2_start)
-            closed_m5 = m5_candles[:-1]  # نستبعد الشمعة غير المكتملة
+        p = pending[symbol]
+        direction = p["direction"]
 
+        if result and str(p["candle2_time"]) != str(result["candle2_time"]) and p["status"] in ("waiting_confirmation",):
+            del pending[symbol]
+            state_changed = True
+            continue
+
+        candle2_start = p["candle2_time"]
+        candle2_end = candle2_start + (60*60*1000)
+        m5_candles = get_klines(symbol, "5m", limit=1500, start_time=candle2_start)
+        closed_m5 = m5_candles[:-1]
+
+        # ===== حالة 2: بانتظار التأكيد =====
+        if p["status"] == "waiting_confirmation":
             window_12 = [c for c in closed_m5 if candle2_start <= c["open_time"] < candle2_end]
-
-            if not p["entry_candle_found"]:
+            if "entry_open" not in p:
                 if len(window_12) < 12:
-                    continue  # لم تكتمل الـ12 شمعة بعد، ننتظر
+                    continue
                 entry_candle = find_entry_candle(window_12, direction)
                 if entry_candle is None:
                     send_telegram(f"❌ {symbol}: لم توجد شمعة دخول صالحة، تم إلغاء النموذج")
@@ -254,31 +278,82 @@ def main():
                     continue
                 p["entry_open"] = entry_candle["open"]
                 p["entry_time"] = entry_candle["open_time"]
-                p["entry_candle_found"] = True
                 state_changed = True
 
-            if p["entry_candle_found"] and not p["confirmed"]:
-                sl_level = p["candle2_low"] if direction == "bullish" else p["candle2_high"]
-                # نفحص كل شمعة تلت شمعة الدخول مباشرة، سواء كانت لا تزال ضمن ساعة شمعة السحب أو بعدها
-                candles_to_check = [c for c in closed_m5 if c["open_time"] > p["entry_time"]]
-                status, confirm_time = check_confirmation(candles_to_check, p["entry_open"], direction, sl_level)
+            sl_level = p["candle2_low"] if direction == "bullish" else p["candle2_high"]
+            candles_to_check = [c for c in closed_m5 if c["open_time"] > p["entry_time"]]
+            status, confirm_time = check_confirmation(candles_to_check, p["entry_open"], direction, sl_level)
 
-                if status == "CANCELLED":
-                    send_telegram(f"❌ {symbol}: تم إلغاء النموذج (كسر السعر مستوى SL قبل التأكيد)")
-                    del pending[symbol]
-                    state_changed = True
-                    continue
-                elif status == "CONFIRMED":
-                    emoji = "🟢" if direction == "bullish" else "🔴"
-                    send_telegram(
-                        f"✅ تأكيد! جاهز للدخول (Shadow Mode)\n\n"
-                        f"{emoji} {symbol}\n"
-                        f"   سعر الدخول المستهدف: {p['entry_open']}\n"
-                        f"   وقت التأكيد (UTC): {datetime.fromtimestamp(confirm_time/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}"
-                    )
-                    p["confirmed"] = True
-                    state_changed = True
-                    # المرحلة التالية (انتظار التنفيذ الفعلي، SL/TP) ستُضاف لاحقاً
+            if status == "CANCELLED":
+                send_telegram(f"❌ {symbol}: تم إلغاء النموذج (كسر السعر مستوى SL قبل التأكيد)")
+                del pending[symbol]
+                state_changed = True
+            elif status == "CONFIRMED":
+                emoji = "🟢" if direction == "bullish" else "🔴"
+                send_telegram(
+                    f"✅ تأكيد! بانتظار تنفيذ السعر الأرخص\n\n"
+                    f"{emoji} {symbol}\n"
+                    f"   سعر الدخول المستهدف: {p['entry_open']}\n"
+                    f"   وقت التأكيد (UTC): {fmt(confirm_time)}"
+                )
+                p["status"] = "waiting_fill"
+                p["confirm_time"] = confirm_time
+                state_changed = True
+            continue
+
+        # ===== حالة 3: بانتظار التنفيذ (الأمر المعلق) =====
+        if p["status"] == "waiting_fill":
+            far_target = p["candle1_high"] if direction == "bullish" else p["candle1_low"]
+            candles_to_check = [c for c in closed_m5 if c["open_time"] > p["confirm_time"]]
+            status, fill_time = check_fill(candles_to_check, p["entry_open"], direction, far_target)
+
+            if status == "CANCELLED_NO_FILL":
+                send_telegram(f"❌ {symbol}: وصل السعر للهدف البعيد دون تنفيذ الأمر — إلغاء تام")
+                del pending[symbol]
+                state_changed = True
+            elif status == "FILLED":
+                sl_buf = SL_BUFFER[symbol]
+                sl_off = STOPLIMIT_OFFSET[symbol]
+                if direction == "bullish":
+                    sl_trigger = p["candle2_low"] - sl_buf
+                    sl_limit = sl_trigger - sl_off
+                else:
+                    sl_trigger = p["candle2_high"] + sl_buf
+                    sl_limit = sl_trigger + sl_off
+                tp1 = p["mid1"]
+
+                emoji = "🟢" if direction == "bullish" else "🔴"
+                send_telegram(
+                    f"🎯 صفقة افتراضية مفتوحة! (Shadow Mode)\n\n"
+                    f"{emoji} {symbol}\n"
+                    f"   الدخول: {p['entry_open']}\n"
+                    f"   وقف الخسارة: {sl_trigger:.2f}\n"
+                    f"   الهدف (TP1): {tp1:.2f}\n"
+                    f"   وقت التنفيذ (UTC): {fmt(fill_time)}"
+                )
+                p["status"] = "position_open"
+                p["fill_time"] = fill_time
+                p["sl_trigger"] = sl_trigger
+                p["sl_limit"] = sl_limit
+                p["tp1"] = tp1
+                state_changed = True
+            continue
+
+        # ===== حالة 4: صفقة مفتوحة =====
+        if p["status"] == "position_open":
+            candles_to_check = [c for c in closed_m5 if c["open_time"] > p["fill_time"]]
+            outcome, exit_time = check_position(candles_to_check, direction, p["sl_trigger"], p["sl_limit"], p["tp1"])
+
+            if outcome:
+                emoji = "✅" if outcome == "TP1" else "❌"
+                result_ar = "ربح (وصل الهدف)" if outcome == "TP1" else "خسارة (ضرب وقف الخسارة)"
+                send_telegram(
+                    f"{emoji} إغلاق الصفقة الافتراضية\n\n"
+                    f"{symbol}: {result_ar}\n"
+                    f"   وقت الإغلاق (UTC): {fmt(exit_time)}"
+                )
+                del pending[symbol]
+                state_changed = True
 
     if state_changed:
         state["last_candle2_time"] = last_seen
