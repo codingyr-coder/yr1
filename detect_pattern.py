@@ -156,13 +156,13 @@ def find_entry_candle(m5_candles_window, direction):
 def check_confirmation(candles_after, entry_open, direction, sl_level):
     for c in candles_after:
         if direction == "bullish":
-            if c["low"] <= sl_level:
-                return "CANCELLED", None
+            if c["low"] < sl_level:
+                return "CANCELLED", c["open_time"]
             if c["close"] > entry_open:
                 return "CONFIRMED", c["open_time"]
         else:
-            if c["high"] >= sl_level:
-                return "CANCELLED", None
+            if c["high"] > sl_level:
+                return "CANCELLED", c["open_time"]
             if c["close"] < entry_open:
                 return "CONFIRMED", c["open_time"]
     return None, None
@@ -290,7 +290,7 @@ def main():
             status, confirm_time = check_confirmation(candles_to_check, p["entry_open"], direction, sl_level)
 
             if status == "CANCELLED":
-                send_telegram(f"❌ {symbol}: تم إلغاء النموذج (كسر السعر مستوى SL قبل التأكيد)")
+                send_telegram(f"❌ {symbol}: تم إلغاء النموذج (كسر السعر مستوى SL قبل التأكيد)\n   وقت الشمعة التي كسرت SL (UTC): {fmt(confirm_time)}")
                 del pending[symbol]
                 state_changed = True
             elif status == "CONFIRMED":
