@@ -208,6 +208,18 @@ def check_position(candles_after, direction, sl_trigger, sl_limit, tp1):
 def fmt(ts):
     return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
 
+def trim_incomplete(candles, interval_ms, now_ms):
+    """
+    يحذف الشمعة الأخيرة فقط إن كانت لم تُغلق فعلياً بعد (بناءً على الوقت الحقيقي)،
+    بدل افتراض أن آخر عنصر في القائمة دائماً غير مكتمل (قد يكون ببساطة نهاية حد الجلب).
+    """
+    if not candles:
+        return candles
+    last = candles[-1]
+    if last["open_time"] + interval_ms > now_ms:
+        return candles[:-1]
+    return candles
+
 def main():
     state = load_state()
     last_seen = state.get("last_candle2_time", {})
@@ -217,7 +229,8 @@ def main():
     for symbol in ["BTCUSDT", "ETHUSDT"]:
         h1_candles = get_klines(symbol, "1h", limit=100)
         current_price = h1_candles[-1]["close"]
-        closed_h1 = h1_candles[:-1]
+        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        closed_h1 = trim_incomplete(h1_candles, 60*60*1000, now_ms)
         result = find_pattern(closed_h1)
 
         # ===== حالة 1: نموذج جديد =====
@@ -253,10 +266,18 @@ def main():
 
         p = pending[symbol]
         if "status" not in p:
-            # بيانات محفوظة بصيغة قديمة غير متوافقة -> نتجاهلها ونبدأ من جديد لهذا الرمز
             del pending[symbol]
             state_changed = True
             continue
+
+        MAX_PENDING_AGE_MS = 7 * 24 * 60 * 60 * 1000  # 7 أيام كحد أقصى للانتظار (قبل فتح الصفقة فقط)
+        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        if p["status"] != "position_open" and now_ms - p["candle2_time"] > MAX_PENDING_AGE_MS:
+            send_telegram(f"⏱️ {symbol}: تم إلغاء نموذج قديم جداً (تجاوز المهلة القصوى بلا تقدم)")
+            del pending[symbol]
+            state_changed = True
+            continue
+
         direction = p["direction"]
 
         if result and str(p["candle2_time"]) != str(result["candle2_time"]) and p["status"] in ("waiting_confirmation",):
@@ -267,7 +288,7 @@ def main():
         candle2_start = p["candle2_time"]
         candle2_end = candle2_start + (60*60*1000)
         m5_candles = get_klines(symbol, "5m", limit=1500, start_time=candle2_start)
-        closed_m5 = m5_candles[:-1]
+        closed_m5 = trim_incomplete(m5_candles, 5*60*1000, now_ms)
 
         # ===== حالة 2: بانتظار التأكيد =====
         if p["status"] == "waiting_confirmation":
@@ -309,7 +330,10 @@ def main():
         # ===== حالة 3: بانتظار التنفيذ (الأمر المعلق) =====
         if p["status"] == "waiting_fill":
             far_target = p["candle1_high"] if direction == "bullish" else p["candle1_low"]
-            candles_to_check = [c for c in closed_m5 if c["open_time"] > p["confirm_time"]]
+            # لا نبدأ البحث عن التنفيذ إلا بعد إغلاق شمعة السحب فعلياً (candle2_end)،
+            # حتى لو تحقق التأكيد قبل ذلك أثناء تكوّنها
+            effective_start = max(p["confirm_time"], candle2_end - 1)
+            candles_to_check = [c for c in closed_m5 if c["open_time"] > effective_start]
             status, fill_time = check_fill(candles_to_check, p["entry_open"], direction, far_target)
 
             if status == "CANCELLED_NO_FILL":
@@ -346,7 +370,7 @@ def main():
 
         # ===== حالة 4: صفقة مفتوحة =====
         if p["status"] == "position_open":
-            candles_to_check = [c for c in closed_m5 if c["open_time"] > p["fill_time"]]
+            candles_to_check = [c for c in closed_m5 if c["open_time"] >= p["fill_time"]]
             outcome, exit_time = check_position(candles_to_check, direction, p["sl_trigger"], p["sl_limit"], p["tp1"])
 
             if outcome:
