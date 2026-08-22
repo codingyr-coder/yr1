@@ -204,14 +204,20 @@ def check_fill(candles_after, entry_open, direction, far_target):
     for c in candles_after:
         if direction == "bullish":
             if c["high"] >= far_target:
-                return "CANCELLED_NO_FILL", None
-            if c["low"] <= entry_open and is_in_trading_window(c["open_time"]):
-                return "FILLED", c["open_time"]
+                return "CANCELLED_NO_FILL", c["open_time"]
+            if c["low"] <= entry_open:
+                if is_in_trading_window(c["open_time"]):
+                    return "FILLED", c["open_time"]
+                else:
+                    return "CANCELLED_OUTSIDE_WINDOW", c["open_time"]
         else:
             if c["low"] <= far_target:
-                return "CANCELLED_NO_FILL", None
-            if c["high"] >= entry_open and is_in_trading_window(c["open_time"]):
-                return "FILLED", c["open_time"]
+                return "CANCELLED_NO_FILL", c["open_time"]
+            if c["high"] >= entry_open:
+                if is_in_trading_window(c["open_time"]):
+                    return "FILLED", c["open_time"]
+                else:
+                    return "CANCELLED_OUTSIDE_WINDOW", c["open_time"]
     return None, None
 
 # ---------- منطق إدارة الصفقة المفتوحة (SL/TP) ----------
@@ -371,6 +377,10 @@ def main():
 
             if status == "CANCELLED_NO_FILL":
                 send_telegram(f"❌ {symbol}: وصل السعر للهدف البعيد دون تنفيذ الأمر — إلغاء تام")
+                del pending[symbol]
+                state_changed = True
+            elif status == "CANCELLED_OUTSIDE_WINDOW":
+                send_telegram(f"❌ {symbol}: تحقق التنفيذ لكن خارج نافذة التداول المسموحة — إلغاء تام\n   وقت اللمسة (UTC): {fmt(fill_time)}")
                 del pending[symbol]
                 state_changed = True
             elif status == "FILLED":
