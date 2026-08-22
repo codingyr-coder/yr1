@@ -153,19 +153,51 @@ def find_entry_candle(m5_candles_window, direction):
         return max(bullish, key=lambda c: c["high"])
 
 # ---------- منطق البحث عن التأكيد ----------
-def check_confirmation(candles_after, entry_open, direction, sl_level):
+def check_confirmation(candles_after, entry_open, direction, sl_level, far_target):
     for c in candles_after:
         if direction == "bullish":
             if c["low"] < sl_level:
+                return "CANCELLED", c["open_time"]
+            if c["high"] >= far_target:
                 return "CANCELLED", c["open_time"]
             if c["close"] > entry_open:
                 return "CONFIRMED", c["open_time"]
         else:
             if c["high"] > sl_level:
                 return "CANCELLED", c["open_time"]
+            if c["low"] <= far_target:
+                return "CANCELLED", c["open_time"]
             if c["close"] < entry_open:
                 return "CONFIRMED", c["open_time"]
     return None, None
+
+# ---------- نافذة التداول المسموحة وحظر الأخبار ----------
+# مواعيد FOMC المؤكدة رسمياً (يوم الإعلان، الثاني من كل اجتماع، بتوقيت UTC)
+# ملاحظة: يجب تحديث هذه القائمة يدوياً كل بضعة أشهر عند إعلان مواعيد جديدة
+FOMC_DATES_UTC = [
+    "2026-09-16 18:00",
+    "2026-10-28 18:00",
+    "2026-12-09 19:00",
+]
+
+def is_news_blackout(open_time_ms):
+    dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
+    for date_str in FOMC_DATES_UTC:
+        event_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        diff_minutes = (dt - event_dt).total_seconds() / 60
+        if -5 <= diff_minutes <= 15:
+            return True
+    return False
+
+def is_in_trading_window(open_time_ms):
+    dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
+    if dt.weekday() >= 5:  # 5=السبت، 6=الأحد
+        return False
+    if not (9 <= dt.hour < 20):
+        return False
+    if is_news_blackout(open_time_ms):
+        return False
+    return True
 
 # ---------- منطق انتظار التنفيذ (الأمر المعلق) ----------
 def check_fill(candles_after, entry_open, direction, far_target):
@@ -173,12 +205,12 @@ def check_fill(candles_after, entry_open, direction, far_target):
         if direction == "bullish":
             if c["high"] >= far_target:
                 return "CANCELLED_NO_FILL", None
-            if c["low"] <= entry_open:
+            if c["low"] <= entry_open and is_in_trading_window(c["open_time"]):
                 return "FILLED", c["open_time"]
         else:
             if c["low"] <= far_target:
                 return "CANCELLED_NO_FILL", None
-            if c["high"] >= entry_open:
+            if c["high"] >= entry_open and is_in_trading_window(c["open_time"]):
                 return "FILLED", c["open_time"]
     return None, None
 
@@ -307,11 +339,12 @@ def main():
                 state_changed = True
 
             sl_level = p["candle2_low"] if direction == "bullish" else p["candle2_high"]
+            far_target = p["candle1_high"] if direction == "bullish" else p["candle1_low"]
             candles_to_check = [c for c in closed_m5 if c["open_time"] > p["entry_time"]]
-            status, confirm_time = check_confirmation(candles_to_check, p["entry_open"], direction, sl_level)
+            status, confirm_time = check_confirmation(candles_to_check, p["entry_open"], direction, sl_level, far_target)
 
             if status == "CANCELLED":
-                send_telegram(f"❌ {symbol}: تم إلغاء النموذج (كسر السعر مستوى SL قبل التأكيد)\n   وقت الشمعة التي كسرت SL (UTC): {fmt(confirm_time)}")
+                send_telegram(f"❌ {symbol}: تم إلغاء النموذج (كسر SL أو وصل السعر للهدف قبل تحقق التأكيد)\n   وقت الإلغاء (UTC): {fmt(confirm_time)}")
                 del pending[symbol]
                 state_changed = True
             elif status == "CONFIRMED":
