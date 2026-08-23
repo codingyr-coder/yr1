@@ -37,6 +37,31 @@ def save_state(state):
     r.raise_for_status()
 
 # ---------- Binance ----------
+def get_spread_pct(symbol):
+    url = f"{BINANCE_BASE}/api/v3/ticker/bookTicker"
+    r = requests.get(url, params={"symbol": symbol})
+    data = r.json()
+    bid = float(data["bidPrice"])
+    ask = float(data["askPrice"])
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid * 100
+
+def log_spread(state, symbol, spread_pct, now_dt):
+    stats = state.setdefault("spread_stats", {})
+    sym_stats = stats.setdefault(symbol, {"by_hour": {}, "by_weekday": {}})
+
+    hour_key = str(now_dt.hour)
+    hour_entry = sym_stats["by_hour"].setdefault(hour_key, {"count": 0, "sum_pct": 0.0})
+    hour_entry["count"] += 1
+    hour_entry["sum_pct"] += spread_pct
+
+    weekday_key = str(now_dt.weekday())  # 0=الاثنين ... 6=الأحد
+    weekday_entry = sym_stats["by_weekday"].setdefault(weekday_key, {"count": 0, "sum_pct": 0.0})
+    weekday_entry["count"] += 1
+    weekday_entry["sum_pct"] += spread_pct
+
 def get_klines(symbol, interval, limit=100, start_time=None, end_time=None):
     url = f"{BINANCE_BASE}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -265,6 +290,15 @@ def main():
     state_changed = False
 
     for symbol in ["BTCUSDT", "ETHUSDT"]:
+        # تسجيل السبريد بصمت (بلا أي تأثير على منطق التداول، بلا أي رسالة Telegram)
+        try:
+            spread_pct = get_spread_pct(symbol)
+            if spread_pct is not None:
+                log_spread(state, symbol, spread_pct, datetime.now(timezone.utc))
+                state_changed = True
+        except Exception:
+            pass  # لا نُفشل التشغيلة كلها بسبب فشل تسجيل السبريد وحده
+
         h1_candles = get_klines(symbol, "1h", limit=100)
         current_price = h1_candles[-1]["close"]
         now_ms = datetime.now(timezone.utc).timestamp() * 1000
