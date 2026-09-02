@@ -9,10 +9,23 @@ GIST_TOKEN = os.environ['GIST_TOKEN']
 GIST_ID = os.environ['GIST_ID']
 
 BINANCE_BASE = "https://data-api.binance.vision"
-WICK_THRESHOLD_PCT = 40.0
+
+# ---------- الإعدادات الرسمية المعتمدة (Option 2 + الهدف المتكيّف) ----------
+BLOCK_PCT = 0.60          # الحد الذي لا يجوز للفتيل المقابل تجاوزه (بدل 50% الأصلية)
+WICK_THRESHOLD_PCT = 40.0  # الحد الأدنى لعمق الفتيل (فلتر الجودة)
+TARGET_SPLIT = 50.0        # نقطة تقسيم الهدف المتكيّف حسب عمق الفتيل
+TARGET_PCT_LOW = 0.15      # الهدف لعمق فتيل أقل من TARGET_SPLIT
+TARGET_PCT_HIGH = 0.25     # الهدف لعمق فتيل أكبر من TARGET_SPLIT
 
 SL_BUFFER = {"BTCUSDT": 5.0, "ETHUSDT": 0.5}
 STOPLIMIT_OFFSET = {"BTCUSDT": 3.0, "ETHUSDT": 0.3}
+
+RISK_BASE_PEAK = 0.02      # المخاطرة الأساسية عند قمة رأس المال (محدّثة)
+RISK_BASE_DRAWDOWN = 0.01  # المخاطرة الأساسية في حالة التراجع (محدّثة)
+
+FOMC_DATES_UTC = [
+    "2026-09-16 18:00", "2026-10-28 18:00", "2026-12-09 19:00",
+]
 
 # ---------- Telegram ----------
 def send_telegram(message):
@@ -36,32 +49,7 @@ def save_state(state):
     r = requests.patch(url, headers=headers, json=payload)
     r.raise_for_status()
 
-# ---------- Binance ----------
-def get_spread_pct(symbol):
-    url = f"{BINANCE_BASE}/api/v3/ticker/bookTicker"
-    r = requests.get(url, params={"symbol": symbol})
-    data = r.json()
-    bid = float(data["bidPrice"])
-    ask = float(data["askPrice"])
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return None
-    return (ask - bid) / mid * 100
-
-def log_spread(state, symbol, spread_pct, now_dt):
-    stats = state.setdefault("spread_stats", {})
-    sym_stats = stats.setdefault(symbol, {"by_hour": {}, "by_weekday": {}})
-
-    hour_key = str(now_dt.hour)
-    hour_entry = sym_stats["by_hour"].setdefault(hour_key, {"count": 0, "sum_pct": 0.0})
-    hour_entry["count"] += 1
-    hour_entry["sum_pct"] += spread_pct
-
-    weekday_key = str(now_dt.weekday())  # 0=الاثنين ... 6=الأحد
-    weekday_entry = sym_stats["by_weekday"].setdefault(weekday_key, {"count": 0, "sum_pct": 0.0})
-    weekday_entry["count"] += 1
-    weekday_entry["sum_pct"] += spread_pct
-
+# ---------- Binance (بيانات السوق الحقيقي) ----------
 def get_klines(symbol, interval, limit=100, start_time=None, end_time=None):
     url = f"{BINANCE_BASE}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -74,15 +62,62 @@ def get_klines(symbol, interval, limit=100, start_time=None, end_time=None):
     candles = []
     for c in data:
         candles.append({
-            "open_time": c[0],
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
+            "open_time": c[0], "open": float(c[1]), "high": float(c[2]),
+            "low": float(c[3]), "close": float(c[4]),
         })
     return candles
 
-# ---------- منطق كشف النموذج على فريم الساعة ----------
+# ---------- تسجيل السبريد (صامت) ----------
+def get_spread_pct(symbol):
+    url = f"{BINANCE_BASE}/api/v3/ticker/bookTicker"
+    r = requests.get(url, params={"symbol": symbol})
+    data = r.json()
+    bid = float(data["bidPrice"]); ask = float(data["askPrice"])
+    mid = (bid + ask) / 2.0
+    return (ask - bid) / mid * 100 if mid > 0 else None
+
+def log_spread(state, symbol, spread_pct, now_dt):
+    stats = state.setdefault("spread_stats", {})
+    sym_stats = stats.setdefault(symbol, {"by_hour": {}, "by_weekday": {}})
+    hour_key = str(now_dt.hour)
+    he = sym_stats["by_hour"].setdefault(hour_key, {"count": 0, "sum_pct": 0.0})
+    he["count"] += 1; he["sum_pct"] += spread_pct
+    wd_key = str(now_dt.weekday())
+    we = sym_stats["by_weekday"].setdefault(wd_key, {"count": 0, "sum_pct": 0.0})
+    we["count"] += 1; we["sum_pct"] += spread_pct
+
+# ---------- نافذة التداول وحظر الأخبار ----------
+def is_news_blackout(open_time_ms):
+    dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
+    for date_str in FOMC_DATES_UTC:
+        event_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        diff_minutes = (dt - event_dt).total_seconds() / 60
+        if -5 <= diff_minutes <= 15:
+            return True
+    return False
+
+def is_in_trading_window(open_time_ms):
+    dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
+    if dt.weekday() >= 5:
+        return False
+    if not (9 <= dt.hour < 20):
+        return False
+    if is_news_blackout(open_time_ms):
+        return False
+    return True
+
+def trim_incomplete(candles, interval_ms, now_ms):
+    if not candles:
+        return candles
+    last = candles[-1]
+    if last["open_time"] + interval_ms > now_ms:
+        return candles[:-1]
+    return candles
+
+def fmt(ts):
+    return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+
+# ---------- منطق كشف النموذج على فريم الساعة (Option 2: block=60%) ----------
 def find_pattern(candles):
     n = len(candles)
     idx = 1
@@ -97,8 +132,9 @@ def find_pattern(candles):
             continue
 
         high1, low1 = c1["high"], c1["low"]
-        mid1 = (high1 + low1) / 2.0
         range1 = high1 - low1
+        block_bull = low1 + BLOCK_PCT * range1
+        block_bear = high1 - BLOCK_PCT * range1
 
         j = idx + 1
         found = False
@@ -120,13 +156,13 @@ def find_pattern(candles):
             close_in_range = low1 <= cj["close"] <= high1
 
             if breaks_bottom and not breaks_top:
-                if cj["high"] < mid1 and open_in_range and close_in_range:
+                if cj["high"] < block_bull and open_in_range and close_in_range:
                     found = True
                     direction = "bullish"
                     c2 = cj
                 break
             elif breaks_top and not breaks_bottom:
-                if cj["low"] > mid1 and open_in_range and close_in_range:
+                if cj["low"] > block_bear and open_in_range and close_in_range:
                     found = True
                     direction = "bearish"
                     c2 = cj
@@ -146,16 +182,22 @@ def find_pattern(candles):
         wick_pct = (wick / range1 * 100) if range1 > 0 else 0
 
         if wick_pct >= WICK_THRESHOLD_PCT:
+            target_pct = TARGET_PCT_LOW if wick_pct < TARGET_SPLIT else TARGET_PCT_HIGH
+            if direction == "bullish":
+                TP1 = low1 + target_pct * range1
+            else:
+                TP1 = high1 - target_pct * range1
+
             last_found = {
                 "direction": direction,
                 "candle1_time": c1["open_time"],
                 "candle1_high": high1,
                 "candle1_low": low1,
-                "mid1": mid1,
+                "TP1": TP1,
+                "target_pct": target_pct,
                 "candle2_high": c2["high"],
                 "candle2_low": c2["low"],
                 "candle2_close": c2["close"],
-                "candle2_open": c2["open"],
                 "wick_pct": wick_pct,
                 "candle2_time": c2["open_time"],
             }
@@ -177,7 +219,7 @@ def find_entry_candle(m5_candles_window, direction):
             return None
         return max(bullish, key=lambda c: c["high"])
 
-# ---------- منطق البحث عن التأكيد ----------
+# ---------- منطق البحث عن التأكيد (يشمل فحص الهدف البعيد قبل التأكيد) ----------
 def check_confirmation(candles_after, entry_open, direction, sl_level, far_target):
     for c in candles_after:
         if direction == "bullish":
@@ -196,35 +238,7 @@ def check_confirmation(candles_after, entry_open, direction, sl_level, far_targe
                 return "CONFIRMED", c["open_time"]
     return None, None
 
-# ---------- نافذة التداول المسموحة وحظر الأخبار ----------
-# مواعيد FOMC المؤكدة رسمياً (يوم الإعلان، الثاني من كل اجتماع، بتوقيت UTC)
-# ملاحظة: يجب تحديث هذه القائمة يدوياً كل بضعة أشهر عند إعلان مواعيد جديدة
-FOMC_DATES_UTC = [
-    "2026-09-16 18:00",
-    "2026-10-28 18:00",
-    "2026-12-09 19:00",
-]
-
-def is_news_blackout(open_time_ms):
-    dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
-    for date_str in FOMC_DATES_UTC:
-        event_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-        diff_minutes = (dt - event_dt).total_seconds() / 60
-        if -5 <= diff_minutes <= 15:
-            return True
-    return False
-
-def is_in_trading_window(open_time_ms):
-    dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
-    if dt.weekday() >= 5:  # 5=السبت، 6=الأحد
-        return False
-    if not (9 <= dt.hour < 20):
-        return False
-    if is_news_blackout(open_time_ms):
-        return False
-    return True
-
-# ---------- منطق انتظار التنفيذ (الأمر المعلق) ----------
+# ---------- منطق انتظار التنفيذ (يجد أول لمسة طبيعية، ثم يفحص النافذة) ----------
 def check_fill(candles_after, entry_open, direction, far_target):
     for c in candles_after:
         if direction == "bullish":
@@ -245,43 +259,40 @@ def check_fill(candles_after, entry_open, direction, far_target):
                     return "CANCELLED_OUTSIDE_WINDOW", c["open_time"]
     return None, None
 
-# ---------- منطق إدارة الصفقة المفتوحة (SL/TP) ----------
+# ---------- منطق إدارة الصفقة المفتوحة (يبدأ من شمعة التنفيذ نفسها) ----------
 def check_position(candles_after, direction, sl_trigger, sl_limit, tp1):
     for c in candles_after:
         if direction == "bullish":
             hit_sl = c["low"] <= sl_trigger
             hit_tp = c["high"] >= tp1
-            if hit_sl and hit_tp:
-                return "SL", c["open_time"]  # الأسوأ دائماً
-            if hit_sl:
-                return "SL", c["open_time"]
-            if hit_tp:
-                return "TP1", c["open_time"]
         else:
             hit_sl = c["high"] >= sl_trigger
             hit_tp = c["low"] <= tp1
-            if hit_sl and hit_tp:
-                return "SL", c["open_time"]
-            if hit_sl:
-                return "SL", c["open_time"]
-            if hit_tp:
-                return "TP1", c["open_time"]
+        if hit_sl:
+            return "SL", c["open_time"]
+        if hit_tp:
+            return "TP1", c["open_time"]
     return None, None
 
-def fmt(ts):
-    return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+# ---------- حساب مئوية التقلب السببية (بلا نظر للمستقبل) ----------
+def compute_vol_percentile(state, symbol, current_atr_pct):
+    hist_key = f"atr_history_{symbol}"
+    hist = state.get(hist_key, [])
+    if len(hist) >= 20:
+        pct = sum(1 for v in hist if v < current_atr_pct) / len(hist)
+    else:
+        pct = 0.5
+    hist.append(current_atr_pct)
+    if len(hist) > 500:
+        hist = hist[-500:]
+    state[hist_key] = hist
+    return pct
 
-def trim_incomplete(candles, interval_ms, now_ms):
-    """
-    يحذف الشمعة الأخيرة فقط إن كانت لم تُغلق فعلياً بعد (بناءً على الوقت الحقيقي)،
-    بدل افتراض أن آخر عنصر في القائمة دائماً غير مكتمل (قد يكون ببساطة نهاية حد الجلب).
-    """
-    if not candles:
-        return candles
-    last = candles[-1]
-    if last["open_time"] + interval_ms > now_ms:
-        return candles[:-1]
-    return candles
+def vol_multiplier(pct):
+    if pct < 0.25: return 0.7
+    elif pct < 0.5: return 0.85
+    elif pct < 0.75: return 1.15
+    else: return 1.3
 
 def main():
     state = load_state()
@@ -290,14 +301,14 @@ def main():
     state_changed = False
 
     for symbol in ["BTCUSDT", "ETHUSDT"]:
-        # تسجيل السبريد بصمت (بلا أي تأثير على منطق التداول، بلا أي رسالة Telegram)
+        # تسجيل السبريد بصمت
         try:
             spread_pct = get_spread_pct(symbol)
             if spread_pct is not None:
                 log_spread(state, symbol, spread_pct, datetime.now(timezone.utc))
                 state_changed = True
         except Exception:
-            pass  # لا نُفشل التشغيلة كلها بسبب فشل تسجيل السبريد وحده
+            pass
 
         h1_candles = get_klines(symbol, "1h", limit=100)
         current_price = h1_candles[-1]["close"]
@@ -305,7 +316,14 @@ def main():
         closed_h1 = trim_incomplete(h1_candles, 60*60*1000, now_ms)
         result = find_pattern(closed_h1)
 
-        # ===== حالة 1: نموذج جديد =====
+        # حساب ATR14 ومئوية التقلب (لحظياً من آخر 20 شمعة)
+        if len(closed_h1) >= 15:
+            trs = [closed_h1[i]["high"]-closed_h1[i]["low"] for i in range(len(closed_h1)-14, len(closed_h1))]
+            atr14 = sum(trs)/14
+            atr_pct = atr14/current_price*100
+        else:
+            atr_pct = None
+
         if result:
             candle2_time_str = str(result["candle2_time"])
             if candle2_time_str != last_seen.get(symbol) and symbol not in pending:
@@ -315,6 +333,7 @@ def main():
                     f"🆕 نموذج جديد! (بانتظار تأكيد فريم 5 دقائق)\n\n"
                     f"{emoji} {symbol}: نموذج {direction_ar}\n"
                     f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
+                    f"   نسبة الهدف المُختارة: {result['target_pct']*100:.0f}%\n"
                     f"   وقت شمعة النطاق: {fmt(result['candle1_time'])}\n"
                     f"   وقت شمعة السحب: {fmt(result['candle2_time'])}\n"
                     f"   السعر الحالي: {current_price}"
@@ -325,7 +344,7 @@ def main():
                     "direction": result["direction"],
                     "candle1_high": result["candle1_high"],
                     "candle1_low": result["candle1_low"],
-                    "mid1": result["mid1"],
+                    "TP1": result["TP1"],
                     "candle2_time": result["candle2_time"],
                     "candle2_low": result["candle2_low"],
                     "candle2_high": result["candle2_high"],
@@ -342,8 +361,7 @@ def main():
             state_changed = True
             continue
 
-        MAX_PENDING_AGE_MS = 7 * 24 * 60 * 60 * 1000  # 7 أيام كحد أقصى للانتظار (قبل فتح الصفقة فقط)
-        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        MAX_PENDING_AGE_MS = 7 * 24 * 60 * 60 * 1000
         if p["status"] != "position_open" and now_ms - p["candle2_time"] > MAX_PENDING_AGE_MS:
             send_telegram(f"⏱️ {symbol}: تم إلغاء نموذج قديم جداً (تجاوز المهلة القصوى بلا تقدم)")
             del pending[symbol]
@@ -362,7 +380,6 @@ def main():
         m5_candles = get_klines(symbol, "5m", limit=1500, start_time=candle2_start)
         closed_m5 = trim_incomplete(m5_candles, 5*60*1000, now_ms)
 
-        # ===== حالة 2: بانتظار التأكيد =====
         if p["status"] == "waiting_confirmation":
             window_12 = [c for c in closed_m5 if candle2_start <= c["open_time"] < candle2_end]
             if "entry_open" not in p:
@@ -400,11 +417,8 @@ def main():
                 state_changed = True
             continue
 
-        # ===== حالة 3: بانتظار التنفيذ (الأمر المعلق) =====
         if p["status"] == "waiting_fill":
             far_target = p["candle1_high"] if direction == "bullish" else p["candle1_low"]
-            # لا نبدأ البحث عن التنفيذ إلا بعد إغلاق شمعة السحب فعلياً (candle2_end)،
-            # حتى لو تحقق التأكيد قبل ذلك أثناء تكوّنها
             effective_start = max(p["confirm_time"], candle2_end - 1)
             candles_to_check = [c for c in closed_m5 if c["open_time"] > effective_start]
             status, fill_time = check_fill(candles_to_check, p["entry_open"], direction, far_target)
@@ -426,15 +440,24 @@ def main():
                 else:
                     sl_trigger = p["candle2_high"] + sl_buf
                     sl_limit = sl_trigger + sl_off
-                tp1 = p["mid1"]
+                tp1 = p["TP1"]
+
+                # حساب حجم المخاطرة (نظام القمة + التقلب المُحدَّث) -- لأغراض العرض في Shadow Mode
+                account_peak = state.get("account_equity_peak", 1.0)
+                account_current = state.get("account_equity_current", 1.0)
+                base_risk = RISK_BASE_PEAK if account_current >= account_peak else RISK_BASE_DRAWDOWN
+                vp = compute_vol_percentile(state, symbol, atr_pct) if atr_pct is not None else 0.5
+                vm = vol_multiplier(vp)
+                final_risk_pct = base_risk * vm
 
                 emoji = "🟢" if direction == "bullish" else "🔴"
                 send_telegram(
                     f"🎯 صفقة افتراضية مفتوحة! (Shadow Mode)\n\n"
                     f"{emoji} {symbol}\n"
                     f"   الدخول: {p['entry_open']}\n"
-                    f"   وقف الخسارة: {sl_trigger:.2f}\n"
-                    f"   الهدف (TP1): {tp1:.2f}\n"
+                    f"   وقف الخسارة: {sl_trigger:.4f}\n"
+                    f"   الهدف (TP1): {tp1:.4f}\n"
+                    f"   المخاطرة المقترحة من رأس المال: {final_risk_pct*100:.2f}%\n"
                     f"   وقت التنفيذ (UTC): {fmt(fill_time)}"
                 )
                 p["status"] = "position_open"
@@ -442,10 +465,10 @@ def main():
                 p["sl_trigger"] = sl_trigger
                 p["sl_limit"] = sl_limit
                 p["tp1"] = tp1
+                p["risk_pct_used"] = final_risk_pct
                 state_changed = True
             continue
 
-        # ===== حالة 4: صفقة مفتوحة =====
         if p["status"] == "position_open":
             candles_to_check = [c for c in closed_m5 if c["open_time"] >= p["fill_time"]]
             outcome, exit_time = check_position(candles_to_check, direction, p["sl_trigger"], p["sl_limit"], p["tp1"])
@@ -453,10 +476,24 @@ def main():
             if outcome:
                 emoji = "✅" if outcome == "TP1" else "❌"
                 result_ar = "ربح (وصل الهدف)" if outcome == "TP1" else "خسارة (ضرب وقف الخسارة)"
+
+                # تحديث رصيد الحساب الافتراضي (Shadow Mode) لتتبع القمة لاحقاً
+                if direction == "bullish":
+                    pnl_pct = ((p["tp1"]-p["entry_open"])/p["entry_open"]) if outcome=="TP1" else ((p["sl_limit"]-p["entry_open"])/p["entry_open"])
+                else:
+                    pnl_pct = ((p["entry_open"]-p["tp1"])/p["entry_open"]) if outcome=="TP1" else ((p["entry_open"]-p["sl_limit"])/p["entry_open"])
+                account_current = state.get("account_equity_current", 1.0)
+                account_current *= (1 + p["risk_pct_used"]*pnl_pct/abs(pnl_pct) * abs(pnl_pct)) if pnl_pct != 0 else account_current
+                # (ملاحظة: هذا تتبع تقريبي لـEquity الافتراضي فقط لغرض حساب القمة، وليس حساباً مالياً دقيقاً بالسنت)
+                account_peak = max(state.get("account_equity_peak", 1.0), account_current)
+                state["account_equity_current"] = account_current
+                state["account_equity_peak"] = account_peak
+
                 send_telegram(
                     f"{emoji} إغلاق الصفقة الافتراضية\n\n"
                     f"{symbol}: {result_ar}\n"
-                    f"   وقت الإغلاق (UTC): {fmt(exit_time)}"
+                    f"   وقت الإغلاق (UTC): {fmt(exit_time)}\n"
+                    f"   رأس المال الافتراضي التراكمي: {account_current:.4f}×"
                 )
                 del pending[symbol]
                 state_changed = True
