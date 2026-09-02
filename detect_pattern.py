@@ -274,7 +274,20 @@ def check_position(candles_after, direction, sl_trigger, sl_limit, tp1):
             return "TP1", c["open_time"]
     return None, None
 
-# ---------- حساب مئوية التقلب السببية (بلا نظر للمستقبل) ----------
+# ---------- حساب مئوية التقلب السببية (بلا نظر للمستقبل، تُحدَّث مرة واحدة فقط لكل شمعة ساعة جديدة) ----------
+def update_atr_history_if_new_hour(state, symbol, current_atr_pct, current_hour_time):
+    last_key = f"atr_last_hour_{symbol}"
+    hist_key = f"atr_history_{symbol}"
+    last_recorded_hour = state.get(last_key)
+    if last_recorded_hour == current_hour_time:
+        return  # نفس الشمعة التي سُجّلت بالفعل، لا تكرار
+    hist = state.get(hist_key, [])
+    hist.append(current_atr_pct)
+    if len(hist) > 2000:
+        hist = hist[-2000:]
+    state[hist_key] = hist
+    state[last_key] = current_hour_time
+
 def compute_vol_percentile(state, symbol, current_atr_pct):
     hist_key = f"atr_history_{symbol}"
     hist = state.get(hist_key, [])
@@ -282,10 +295,6 @@ def compute_vol_percentile(state, symbol, current_atr_pct):
         pct = sum(1 for v in hist if v < current_atr_pct) / len(hist)
     else:
         pct = 0.5
-    hist.append(current_atr_pct)
-    if len(hist) > 500:
-        hist = hist[-500:]
-    state[hist_key] = hist
     return pct
 
 def vol_multiplier(pct):
@@ -321,6 +330,12 @@ def main():
             trs = [closed_h1[i]["high"]-closed_h1[i]["low"] for i in range(len(closed_h1)-14, len(closed_h1))]
             atr14 = sum(trs)/14
             atr_pct = atr14/current_price*100
+            # تسجيل مستمر وغير متحيّز: مرة واحدة فقط لكل شمعة ساعة جديدة، بغض النظر عن حدوث صفقة
+            current_hour_time = closed_h1[-1]["open_time"]
+            before = state.get(f"atr_last_hour_{symbol}")
+            update_atr_history_if_new_hour(state, symbol, atr_pct, current_hour_time)
+            if state.get(f"atr_last_hour_{symbol}") != before:
+                state_changed = True
         else:
             atr_pct = None
 
@@ -480,11 +495,14 @@ def main():
                 # تحديث رصيد الحساب الافتراضي (Shadow Mode) لتتبع القمة لاحقاً
                 if direction == "bullish":
                     pnl_pct = ((p["tp1"]-p["entry_open"])/p["entry_open"]) if outcome=="TP1" else ((p["sl_limit"]-p["entry_open"])/p["entry_open"])
+                    price_risk_pct = (p["entry_open"]-p["sl_trigger"])/p["entry_open"]
                 else:
                     pnl_pct = ((p["entry_open"]-p["tp1"])/p["entry_open"]) if outcome=="TP1" else ((p["entry_open"]-p["sl_limit"])/p["entry_open"])
+                    price_risk_pct = (p["sl_trigger"]-p["entry_open"])/p["entry_open"]
+
+                r_multiple = pnl_pct / price_risk_pct if price_risk_pct > 0 else 0
                 account_current = state.get("account_equity_current", 1.0)
-                account_current *= (1 + p["risk_pct_used"]*pnl_pct/abs(pnl_pct) * abs(pnl_pct)) if pnl_pct != 0 else account_current
-                # (ملاحظة: هذا تتبع تقريبي لـEquity الافتراضي فقط لغرض حساب القمة، وليس حساباً مالياً دقيقاً بالسنت)
+                account_current *= (1 + p["risk_pct_used"] * r_multiple)
                 account_peak = max(state.get("account_equity_peak", 1.0), account_current)
                 state["account_equity_current"] = account_current
                 state["account_equity_peak"] = account_peak
@@ -504,4 +522,11 @@ def main():
         save_state(state)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        try:
+            send_telegram(f"🚨 خطأ غير متوقع أوقف البوت هذه التشغيلة:\n\n{type(e).__name__}: {str(e)}")
+        except Exception:
+            pass  # حتى لو فشل إرسال التنبيه نفسه، لا نُريد أن يُخفي هذا الخطأ الأصلي
+        raise  # نُعيد رفع الخطأ حتى يظهر بوضوح في سجل GitHub Actions أيضاً
