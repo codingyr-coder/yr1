@@ -27,8 +27,20 @@ TAKER_FEE = 0.0005  # 0.05%
 RISK_BASE_PEAK = 0.0175     # المخاطرة الأساسية عند قمة رأس المال (محدّثة بعد فحص التراجع اليومي)
 RISK_BASE_DRAWDOWN = 0.00875  # المخاطرة الأساسية في حالة التراجع
 
-FOMC_DATES_UTC = [
-    "2026-09-16 18:00", "2026-10-28 18:00", "2026-12-09 19:00",
+# كل حدث: (التاريخ والوقت UTC، دقائق قبل الحدث، دقائق بعده)
+# ملاحظة صيانة: يحتاج تحديثاً دورياً كل 4-6 أسابيع تقريباً (مواعيد الأشهر البعيدة تقديرية وتحتاج تأكيداً لاحقاً)
+NEWS_BLACKOUT_EVENTS = [
+    # FOMC (قرار + مؤتمر صحفي) -- نافذة أطول (90 دقيقة بعد) لتغطية المؤتمر الصحفي كاملاً
+    ("2026-09-16 18:00", 5, 90),
+    ("2026-10-28 18:00", 5, 90),
+    ("2026-12-09 19:00", 5, 90),
+    # NFP -- نافذة قصيرة (بيانات رقمية لحظية فقط)
+    ("2026-09-04 12:30", 5, 15),
+    ("2026-10-02 12:30", 5, 15),
+    ("2026-11-06 13:30", 5, 15),
+    ("2026-12-04 13:30", 5, 15),
+    # PCE -- نافذة قصيرة (مؤكد: سبتمبر فقط، الباقي تقديري يحتاج تأكيداً لاحقاً)
+    ("2026-09-30 12:30", 5, 15),
 ]
 
 # ---------- Telegram ----------
@@ -101,17 +113,25 @@ def log_spread(state, symbol, spread_pct, now_dt, vol_pct=None, volume_pct=None)
 # ---------- حظر الأخبار (لم تعد هناك نافذة توقيت عامة) ----------
 def is_news_blackout(open_time_ms):
     dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
-    for date_str in FOMC_DATES_UTC:
+    for date_str, before_min, after_min in NEWS_BLACKOUT_EVENTS:
         event_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
         diff_minutes = (dt - event_dt).total_seconds() / 60
-        if -5 <= diff_minutes <= 15:
+        if -before_min <= diff_minutes <= after_min:
             return True
     return False
 
 def is_execution_allowed(open_time_ms):
     # لم يعد هناك قيد يوم/ساعة -- استُبدل بفلتر الحجم عند اكتشاف النموذج
-    # يبقى فقط حظر الأخبار (FOMC/CPI)، مستقلاً تماماً
+    # يبقى فقط حظر الأخبار (FOMC/CPI/NFP/PCE)، مستقلاً تماماً
     return not is_news_blackout(open_time_ms)
+
+# ---------- قاطع تلقائي للتقلب الشاذ (حماية من الأحداث المفاجئة غير المجدولة) ----------
+CIRCUIT_BREAKER_PERCENTILE = 0.99  # أعلى 1% من التقلب التاريخي يُعتبر شاذاً
+CIRCUIT_BREAKER_COOLDOWN_MS = 2 * 60 * 60 * 1000  # ساعتان تهدئة بعد كشف تقلب شاذ
+
+def is_circuit_breaker_active(state, symbol, now_ms):
+    until = state.get(f"circuit_breaker_until_{symbol}")
+    return until is not None and now_ms < until
 
 def trim_incomplete(candles, interval_ms, now_ms):
     if not candles:
@@ -388,6 +408,19 @@ def main():
             update_atr_history_if_new_hour(state, symbol, atr_pct, current_hour_time)
             if state.get(f"atr_last_hour_{symbol}") != before:
                 state_changed = True
+                # القاطع التلقائي: نفحص مدى الشمعة الخام (غير المُنعَّم) -- شمعة واحدة شاذة تكفي للتفعيل
+                single_candle_range_pct = (closed_h1[-1]["high"]-closed_h1[-1]["low"])/current_price*100
+                cb_hist_key = f"raw_range_history_{symbol}"
+                cb_hist = state.get(cb_hist_key, [])
+                if len(cb_hist) >= 30:
+                    cb_pct = sum(1 for v in cb_hist if v < single_candle_range_pct) / len(cb_hist)
+                    if cb_pct >= CIRCUIT_BREAKER_PERCENTILE:
+                        state[f"circuit_breaker_until_{symbol}"] = now_ms + CIRCUIT_BREAKER_COOLDOWN_MS
+                        send_telegram(f"🛑 {symbol}: قاطع تلقائي مُفعَّل! تقلب شاذ رُصد (مدى الشمعة الأخيرة: {single_candle_range_pct:.2f}%). إيقاف قبول نماذج جديدة لساعتين.")
+                cb_hist.append(single_candle_range_pct)
+                if len(cb_hist) > 2000:
+                    cb_hist = cb_hist[-2000:]
+                state[cb_hist_key] = cb_hist
         else:
             atr_pct = None
 
@@ -414,6 +447,10 @@ def main():
         if result:
             candle2_time_str = str(result["candle2_time"])
             if candle2_time_str != last_seen.get(symbol) and symbol not in pending:
+                if is_circuit_breaker_active(state, symbol, now_ms):
+                    # لا نُسجّل last_seen هنا عمداً -- القاطع مؤقت، نريد إعادة النظر في نفس النموذج
+                    # بمجرد انتهاء التهدئة لو بقي هو الأحدث
+                    continue
                 current_vol_pct_for_pattern = compute_volume_percentile(state, symbol, result["candle2_volume"])
                 if current_vol_pct_for_pattern < VOLUME_THRESHOLD[symbol]:
                     # حجم ضعيف جداً -> تجاهل هذا النموذج تماماً (بديل نافذة التوقيت)
@@ -522,7 +559,7 @@ def main():
                 del pending[symbol]
                 state_changed = True
             elif status == "CANCELLED_OUTSIDE_WINDOW":
-                send_telegram(f"❌ {symbol}: تحقق التنفيذ لكن أثناء حظر الأخبار (FOMC/CPI) — إلغاء تام\n   وقت اللمسة (UTC): {fmt(fill_time)}")
+                send_telegram(f"❌ {symbol}: تحقق التنفيذ لكن أثناء حظر الأخبار (FOMC/NFP/PCE/CPI) — إلغاء تام\n   وقت اللمسة (UTC): {fmt(fill_time)}")
                 del pending[symbol]
                 state_changed = True
             elif status == "FILLED":
