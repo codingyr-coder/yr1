@@ -21,6 +21,9 @@ SL_BUFFER = {"BTCUSDT": 5.0, "ETHUSDT": 0.5}
 STOPLIMIT_OFFSET = {"BTCUSDT": 3.0, "ETHUSDT": 0.3}
 VOLUME_THRESHOLD = {"BTCUSDT": 0.40, "ETHUSDT": 0.30}  # الحد الأدنى لمئوية الحجم (بدل نافذة التوقيت)
 
+MAKER_FEE = 0.0002  # 0.02% -- نفس القيمة المستخدمة في كل الباك تيست
+TAKER_FEE = 0.0005  # 0.05%
+
 RISK_BASE_PEAK = 0.0175     # المخاطرة الأساسية عند قمة رأس المال (محدّثة بعد فحص التراجع اليومي)
 RISK_BASE_DRAWDOWN = 0.00875  # المخاطرة الأساسية في حالة التراجع
 
@@ -264,20 +267,50 @@ def check_fill(candles_after, entry_open, direction, far_target):
                     return "CANCELLED_OUTSIDE_WINDOW", c["open_time"]
     return None, None
 
-# ---------- منطق إدارة الصفقة المفتوحة (يبدأ من شمعة التنفيذ نفسها) ----------
-def check_position(candles_after, direction, sl_trigger, sl_limit, tp1):
+# ---------- منطق إدارة الصفقة المفتوحة (محاكاة واقعية لنظام الحماية الثلاثي) ----------
+def check_position(candles_after, direction, sl_trigger, sl_limit, tp1, already_triggered=False, trigger_time=None):
+    """
+    يُحاكي فعلياً: تفعيل SL لا يعني تنفيذه الفوري (أمر Limit قد لا يُنفَّذ إن قفز السعر).
+    لو لم يُنفَّذ خلال 5 دقائق (شمعة واحدة) من التفعيل -> نُحاكي ترقية لأمر Market
+    (تنفيذ بسعر إغلاق تلك الشمعة، وهو أسوأ من sl_limit المخطط له غالباً).
+    يرجع: (النتيجة, وقت الخروج, سعر الخروج الفعلي, هل SL مُفعَّل لكن لم يُنفَّذ بعد, وقت التفعيل الحقيقي)
+    """
+    trig = already_triggered
+    trig_time = trigger_time
     for c in candles_after:
         if direction == "bullish":
-            hit_sl = c["low"] <= sl_trigger
-            hit_tp = c["high"] >= tp1
+            if not trig:
+                if c["low"] <= sl_trigger:
+                    trig = True
+                    trig_time = c["open_time"]
+                    if c["low"] <= sl_limit:
+                        return "SL", c["open_time"], sl_limit, False, None
+                if c["high"] >= tp1:
+                    return "TP1", c["open_time"], tp1, False, None
+            else:
+                if c["low"] <= sl_limit:
+                    return "SL", c["open_time"], sl_limit, False, None
+                if c["high"] >= tp1:
+                    return "TP1", c["open_time"], tp1, False, None
+                if (c["open_time"] - trig_time) >= 5*60*1000:
+                    return "SL_MARKET", c["open_time"], c["close"], False, None
         else:
-            hit_sl = c["high"] >= sl_trigger
-            hit_tp = c["low"] <= tp1
-        if hit_sl:
-            return "SL", c["open_time"]
-        if hit_tp:
-            return "TP1", c["open_time"]
-    return None, None
+            if not trig:
+                if c["high"] >= sl_trigger:
+                    trig = True
+                    trig_time = c["open_time"]
+                    if c["high"] >= sl_limit:
+                        return "SL", c["open_time"], sl_limit, False, None
+                if c["low"] <= tp1:
+                    return "TP1", c["open_time"], tp1, False, None
+            else:
+                if c["high"] >= sl_limit:
+                    return "SL", c["open_time"], sl_limit, False, None
+                if c["low"] <= tp1:
+                    return "TP1", c["open_time"], tp1, False, None
+                if (c["open_time"] - trig_time) >= 5*60*1000:
+                    return "SL_MARKET", c["open_time"], c["close"], False, None
+    return None, None, None, trig, trig_time
 
 # ---------- حساب مئوية التقلب السببية (بلا نظر للمستقبل، تُحدَّث مرة واحدة فقط لكل شمعة ساعة جديدة) ----------
 def update_atr_history_if_new_hour(state, symbol, current_atr_pct, current_hour_time):
@@ -532,35 +565,68 @@ def main():
 
         if p["status"] == "position_open":
             candles_to_check = [c for c in closed_m5 if c["open_time"] >= p["fill_time"]]
-            outcome, exit_time = check_position(candles_to_check, direction, p["sl_trigger"], p["sl_limit"], p["tp1"])
+            already_triggered = p.get("sl_already_triggered", False)
+            trigger_time = p.get("sl_trigger_time")
+            outcome, exit_time, exit_price, still_triggered, returned_trigger_time = check_position(
+                candles_to_check, direction, p["sl_trigger"], p["sl_limit"], p["tp1"],
+                already_triggered=already_triggered, trigger_time=trigger_time
+            )
 
-            if outcome:
-                emoji = "✅" if outcome == "TP1" else "❌"
-                result_ar = "ربح (وصل الهدف)" if outcome == "TP1" else "خسارة (ضرب وقف الخسارة)"
+            if outcome is None:
+                # لم يُحسم بعد -- نحفظ وقت التفعيل الحقيقي (لا تقريبياً) للتشغيلة القادمة
+                if still_triggered and not already_triggered:
+                    p["sl_already_triggered"] = True
+                    p["sl_trigger_time"] = returned_trigger_time
+                    state_changed = True
+                continue
 
-                # تحديث رصيد الحساب الافتراضي (Shadow Mode) لتتبع القمة لاحقاً
-                if direction == "bullish":
-                    pnl_pct = ((p["tp1"]-p["entry_open"])/p["entry_open"]) if outcome=="TP1" else ((p["sl_limit"]-p["entry_open"])/p["entry_open"])
-                    price_risk_pct = (p["entry_open"]-p["sl_trigger"])/p["entry_open"]
-                else:
-                    pnl_pct = ((p["entry_open"]-p["tp1"])/p["entry_open"]) if outcome=="TP1" else ((p["entry_open"]-p["sl_limit"])/p["entry_open"])
-                    price_risk_pct = (p["sl_trigger"]-p["entry_open"])/p["entry_open"]
+            emoji = "✅" if outcome == "TP1" else "❌"
+            if outcome == "TP1":
+                result_ar = "ربح (وصل الهدف)"
+            elif outcome == "SL":
+                result_ar = "خسارة (ضرب وقف الخسارة - Stop-Limit نُفِّذ بنجاح)"
+            else:  # SL_MARKET
+                result_ar = "خسارة (فشل Stop-Limit، تمت محاكاة ترقية لأمر Market)"
 
-                r_multiple = pnl_pct / price_risk_pct if price_risk_pct > 0 else 0
-                account_current = state.get("account_equity_current", 1.0)
-                account_current *= (1 + p["risk_pct_used"] * r_multiple)
-                account_peak = max(state.get("account_equity_peak", 1.0), account_current)
-                state["account_equity_current"] = account_current
-                state["account_equity_peak"] = account_peak
+            # تحديث رصيد الحساب الافتراضي -- نستخدم سعر الخروج الفعلي المُحاكى، لا افتراضاً ثابتاً
+            if direction == "bullish":
+                pnl_pct = (exit_price - p["entry_open"]) / p["entry_open"]
+                price_risk_pct = (p["entry_open"] - p["sl_trigger"]) / p["entry_open"]
+            else:
+                pnl_pct = (p["entry_open"] - exit_price) / p["entry_open"]
+                price_risk_pct = (p["sl_trigger"] - p["entry_open"]) / p["entry_open"]
 
-                send_telegram(
-                    f"{emoji} إغلاق الصفقة الافتراضية\n\n"
-                    f"{symbol}: {result_ar}\n"
-                    f"   وقت الإغلاق (UTC): {fmt(exit_time)}\n"
-                    f"   رأس المال الافتراضي التراكمي: {account_current:.4f}×"
-                )
-                del pending[symbol]
-                state_changed = True
+            if outcome == "TP1":
+                exit_fee = MAKER_FEE
+                exit_spread = 0.0  # أمر Limit، لا يعبر السبريد
+            elif outcome == "SL":
+                exit_fee = TAKER_FEE
+                try:
+                    live_spread = get_spread_pct(symbol)
+                    exit_spread = (live_spread / 100) if live_spread is not None else 0.0
+                except Exception:
+                    exit_spread = 0.0
+            else:  # SL_MARKET -- السعر نفسه يعكس الانزلاق الفعلي، لا نُضيف سبريد إضافياً فوقه
+                exit_fee = TAKER_FEE
+                exit_spread = 0.0
+
+            net_pnl_pct = pnl_pct - MAKER_FEE - exit_fee - exit_spread
+            r_multiple = net_pnl_pct / price_risk_pct if price_risk_pct > 0 else 0
+            account_current = state.get("account_equity_current", 1.0)
+            account_current *= (1 + p["risk_pct_used"] * r_multiple)
+            account_peak = max(state.get("account_equity_peak", 1.0), account_current)
+            state["account_equity_current"] = account_current
+            state["account_equity_peak"] = account_peak
+
+            send_telegram(
+                f"{emoji} إغلاق الصفقة الافتراضية\n\n"
+                f"{symbol}: {result_ar}\n"
+                f"   سعر الخروج الفعلي: {exit_price:.4f}\n"
+                f"   وقت الإغلاق (UTC): {fmt(exit_time)}\n"
+                f"   رأس المال الافتراضي التراكمي: {account_current:.4f}×"
+            )
+            del pending[symbol]
+            state_changed = True
 
     if state_changed:
         state["last_candle2_time"] = last_seen
