@@ -76,15 +76,19 @@ def get_spread_pct(symbol):
     mid = (bid + ask) / 2.0
     return (ask - bid) / mid * 100 if mid > 0 else None
 
-def log_spread(state, symbol, spread_pct, now_dt):
+def log_spread(state, symbol, spread_pct, now_dt, vol_pct=None):
     stats = state.setdefault("spread_stats", {})
-    sym_stats = stats.setdefault(symbol, {"by_hour": {}, "by_weekday": {}})
+    sym_stats = stats.setdefault(symbol, {"by_hour": {}, "by_weekday": {}, "by_volatility": {}})
     hour_key = str(now_dt.hour)
     he = sym_stats["by_hour"].setdefault(hour_key, {"count": 0, "sum_pct": 0.0})
     he["count"] += 1; he["sum_pct"] += spread_pct
     wd_key = str(now_dt.weekday())
     we = sym_stats["by_weekday"].setdefault(wd_key, {"count": 0, "sum_pct": 0.0})
     we["count"] += 1; we["sum_pct"] += spread_pct
+    if vol_pct is not None:
+        vol_bucket = "low" if vol_pct<0.25 else "medium" if vol_pct<0.5 else "high" if vol_pct<0.75 else "very_high"
+        ve = sym_stats["by_volatility"].setdefault(vol_bucket, {"count": 0, "sum_pct": 0.0})
+        ve["count"] += 1; ve["sum_pct"] += spread_pct
 
 # ---------- نافذة التداول وحظر الأخبار ----------
 def is_news_blackout(open_time_ms):
@@ -310,15 +314,6 @@ def main():
     state_changed = False
 
     for symbol in ["BTCUSDT", "ETHUSDT"]:
-        # تسجيل السبريد بصمت
-        try:
-            spread_pct = get_spread_pct(symbol)
-            if spread_pct is not None:
-                log_spread(state, symbol, spread_pct, datetime.now(timezone.utc))
-                state_changed = True
-        except Exception:
-            pass
-
         h1_candles = get_klines(symbol, "1h", limit=100)
         current_price = h1_candles[-1]["close"]
         now_ms = datetime.now(timezone.utc).timestamp() * 1000
@@ -338,6 +333,16 @@ def main():
                 state_changed = True
         else:
             atr_pct = None
+
+        # تسجيل السبريد بصمت (الآن مع سياق مستوى التقلب في نفس اللحظة)
+        try:
+            spread_pct = get_spread_pct(symbol)
+            if spread_pct is not None:
+                current_vol_pct = compute_vol_percentile(state, symbol, atr_pct) if atr_pct is not None else None
+                log_spread(state, symbol, spread_pct, datetime.now(timezone.utc), vol_pct=current_vol_pct)
+                state_changed = True
+        except Exception:
+            pass
 
         if result:
             candle2_time_str = str(result["candle2_time"])
