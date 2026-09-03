@@ -19,9 +19,10 @@ TARGET_PCT_HIGH = 0.25     # الهدف لعمق فتيل أكبر من TARGET_S
 
 SL_BUFFER = {"BTCUSDT": 5.0, "ETHUSDT": 0.5}
 STOPLIMIT_OFFSET = {"BTCUSDT": 3.0, "ETHUSDT": 0.3}
+VOLUME_THRESHOLD = {"BTCUSDT": 0.40, "ETHUSDT": 0.30}  # الحد الأدنى لمئوية الحجم (بدل نافذة التوقيت)
 
-RISK_BASE_PEAK = 0.02      # المخاطرة الأساسية عند قمة رأس المال (محدّثة)
-RISK_BASE_DRAWDOWN = 0.01  # المخاطرة الأساسية في حالة التراجع (محدّثة)
+RISK_BASE_PEAK = 0.0175     # المخاطرة الأساسية عند قمة رأس المال (محدّثة بعد فحص التراجع اليومي)
+RISK_BASE_DRAWDOWN = 0.00875  # المخاطرة الأساسية في حالة التراجع
 
 FOMC_DATES_UTC = [
     "2026-09-16 18:00", "2026-10-28 18:00", "2026-12-09 19:00",
@@ -63,7 +64,7 @@ def get_klines(symbol, interval, limit=100, start_time=None, end_time=None):
     for c in data:
         candles.append({
             "open_time": c[0], "open": float(c[1]), "high": float(c[2]),
-            "low": float(c[3]), "close": float(c[4]),
+            "low": float(c[3]), "close": float(c[4]), "volume": float(c[5]),
         })
     return candles
 
@@ -76,9 +77,9 @@ def get_spread_pct(symbol):
     mid = (bid + ask) / 2.0
     return (ask - bid) / mid * 100 if mid > 0 else None
 
-def log_spread(state, symbol, spread_pct, now_dt, vol_pct=None):
+def log_spread(state, symbol, spread_pct, now_dt, vol_pct=None, volume_pct=None):
     stats = state.setdefault("spread_stats", {})
-    sym_stats = stats.setdefault(symbol, {"by_hour": {}, "by_weekday": {}, "by_volatility": {}})
+    sym_stats = stats.setdefault(symbol, {"by_hour": {}, "by_weekday": {}, "by_volatility": {}, "by_volume": {}})
     hour_key = str(now_dt.hour)
     he = sym_stats["by_hour"].setdefault(hour_key, {"count": 0, "sum_pct": 0.0})
     he["count"] += 1; he["sum_pct"] += spread_pct
@@ -89,8 +90,12 @@ def log_spread(state, symbol, spread_pct, now_dt, vol_pct=None):
         vol_bucket = "low" if vol_pct<0.25 else "medium" if vol_pct<0.5 else "high" if vol_pct<0.75 else "very_high"
         ve = sym_stats["by_volatility"].setdefault(vol_bucket, {"count": 0, "sum_pct": 0.0})
         ve["count"] += 1; ve["sum_pct"] += spread_pct
+    if volume_pct is not None:
+        volume_bucket = "low" if volume_pct<0.25 else "medium" if volume_pct<0.5 else "high" if volume_pct<0.75 else "very_high"
+        vle = sym_stats["by_volume"].setdefault(volume_bucket, {"count": 0, "sum_pct": 0.0})
+        vle["count"] += 1; vle["sum_pct"] += spread_pct
 
-# ---------- نافذة التداول وحظر الأخبار ----------
+# ---------- حظر الأخبار (لم تعد هناك نافذة توقيت عامة) ----------
 def is_news_blackout(open_time_ms):
     dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
     for date_str in FOMC_DATES_UTC:
@@ -100,15 +105,10 @@ def is_news_blackout(open_time_ms):
             return True
     return False
 
-def is_in_trading_window(open_time_ms):
-    dt = datetime.fromtimestamp(open_time_ms/1000, tz=timezone.utc)
-    if dt.weekday() >= 5:
-        return False
-    if not (9 <= dt.hour < 20):
-        return False
-    if is_news_blackout(open_time_ms):
-        return False
-    return True
+def is_execution_allowed(open_time_ms):
+    # لم يعد هناك قيد يوم/ساعة -- استُبدل بفلتر الحجم عند اكتشاف النموذج
+    # يبقى فقط حظر الأخبار (FOMC/CPI)، مستقلاً تماماً
+    return not is_news_blackout(open_time_ms)
 
 def trim_incomplete(candles, interval_ms, now_ms):
     if not candles:
@@ -202,6 +202,7 @@ def find_pattern(candles):
                 "candle2_high": c2["high"],
                 "candle2_low": c2["low"],
                 "candle2_close": c2["close"],
+                "candle2_volume": c2["volume"],
                 "wick_pct": wick_pct,
                 "candle2_time": c2["open_time"],
             }
@@ -249,7 +250,7 @@ def check_fill(candles_after, entry_open, direction, far_target):
             if c["high"] >= far_target:
                 return "CANCELLED_NO_FILL", c["open_time"]
             if c["low"] <= entry_open:
-                if is_in_trading_window(c["open_time"]):
+                if is_execution_allowed(c["open_time"]):
                     return "FILLED", c["open_time"]
                 else:
                     return "CANCELLED_OUTSIDE_WINDOW", c["open_time"]
@@ -257,7 +258,7 @@ def check_fill(candles_after, entry_open, direction, far_target):
             if c["low"] <= far_target:
                 return "CANCELLED_NO_FILL", c["open_time"]
             if c["high"] >= entry_open:
-                if is_in_trading_window(c["open_time"]):
+                if is_execution_allowed(c["open_time"]):
                     return "FILLED", c["open_time"]
                 else:
                     return "CANCELLED_OUTSIDE_WINDOW", c["open_time"]
@@ -307,6 +308,29 @@ def vol_multiplier(pct):
     elif pct < 0.75: return 1.15
     else: return 1.3
 
+# ---------- حساب مئوية الحجم (فلتر السيولة، بدل نافذة التوقيت) ----------
+def update_volume_history_if_new_hour(state, symbol, current_volume, current_hour_time):
+    last_key = f"vol_last_hour_{symbol}"
+    hist_key = f"volume_history_{symbol}"
+    last_recorded_hour = state.get(last_key)
+    if last_recorded_hour == current_hour_time:
+        return
+    hist = state.get(hist_key, [])
+    hist.append(current_volume)
+    if len(hist) > 2000:
+        hist = hist[-2000:]
+    state[hist_key] = hist
+    state[last_key] = current_hour_time
+
+def compute_volume_percentile(state, symbol, current_volume):
+    hist_key = f"volume_history_{symbol}"
+    hist = state.get(hist_key, [])
+    if len(hist) >= 20:
+        pct = sum(1 for v in hist if v < current_volume) / len(hist)
+    else:
+        pct = 0.5
+    return pct
+
 def main():
     state = load_state()
     last_seen = state.get("last_candle2_time", {})
@@ -334,12 +358,22 @@ def main():
         else:
             atr_pct = None
 
+        # تسجيل مستمر لتاريخ الحجم (لفلتر السيولة، بدل نافذة التوقيت)
+        if len(closed_h1) >= 1:
+            current_volume = closed_h1[-1]["volume"]
+            current_hour_time_vol = closed_h1[-1]["open_time"]
+            before_vol = state.get(f"vol_last_hour_{symbol}")
+            update_volume_history_if_new_hour(state, symbol, current_volume, current_hour_time_vol)
+            if state.get(f"vol_last_hour_{symbol}") != before_vol:
+                state_changed = True
+
         # تسجيل السبريد بصمت (الآن مع سياق مستوى التقلب في نفس اللحظة)
         try:
             spread_pct = get_spread_pct(symbol)
             if spread_pct is not None:
                 current_vol_pct = compute_vol_percentile(state, symbol, atr_pct) if atr_pct is not None else None
-                log_spread(state, symbol, spread_pct, datetime.now(timezone.utc), vol_pct=current_vol_pct)
+                current_volume_pct = compute_volume_percentile(state, symbol, current_volume) if len(closed_h1) >= 1 else None
+                log_spread(state, symbol, spread_pct, datetime.now(timezone.utc), vol_pct=current_vol_pct, volume_pct=current_volume_pct)
                 state_changed = True
         except Exception:
             pass
@@ -347,6 +381,12 @@ def main():
         if result:
             candle2_time_str = str(result["candle2_time"])
             if candle2_time_str != last_seen.get(symbol) and symbol not in pending:
+                current_vol_pct_for_pattern = compute_volume_percentile(state, symbol, result["candle2_volume"])
+                if current_vol_pct_for_pattern < VOLUME_THRESHOLD[symbol]:
+                    # حجم ضعيف جداً -> تجاهل هذا النموذج تماماً (بديل نافذة التوقيت)
+                    last_seen[symbol] = candle2_time_str
+                    state_changed = True
+                    continue
                 emoji = "🟢" if result["direction"] == "bullish" else "🔴"
                 direction_ar = "صاعد" if result["direction"] == "bullish" else "هابط"
                 send_telegram(
@@ -354,6 +394,7 @@ def main():
                     f"{emoji} {symbol}: نموذج {direction_ar}\n"
                     f"   عمق الفتيل: {result['wick_pct']:.1f}%\n"
                     f"   نسبة الهدف المُختارة: {result['target_pct']*100:.0f}%\n"
+                    f"   مئوية الحجم: {current_vol_pct_for_pattern*100:.0f}%\n"
                     f"   وقت شمعة النطاق: {fmt(result['candle1_time'])}\n"
                     f"   وقت شمعة السحب: {fmt(result['candle2_time'])}\n"
                     f"   السعر الحالي: {current_price}"
@@ -448,7 +489,7 @@ def main():
                 del pending[symbol]
                 state_changed = True
             elif status == "CANCELLED_OUTSIDE_WINDOW":
-                send_telegram(f"❌ {symbol}: تحقق التنفيذ لكن خارج نافذة التداول المسموحة — إلغاء تام\n   وقت اللمسة (UTC): {fmt(fill_time)}")
+                send_telegram(f"❌ {symbol}: تحقق التنفيذ لكن أثناء حظر الأخبار (FOMC/CPI) — إلغاء تام\n   وقت اللمسة (UTC): {fmt(fill_time)}")
                 del pending[symbol]
                 state_changed = True
             elif status == "FILLED":
