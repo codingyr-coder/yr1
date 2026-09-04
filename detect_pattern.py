@@ -1,8 +1,7 @@
 import os
 import json
-import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
